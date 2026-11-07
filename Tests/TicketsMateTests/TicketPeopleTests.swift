@@ -1,0 +1,26 @@
+import XCTest
+@testable import TicketsMateCore
+
+final class TicketPeopleTests: XCTestCase {
+    func testPersonAttributesKeepOnlyUidValues() throws {
+        let json = """
+        {"ID": 1, "Attributes": [
+            {"ID": 10, "Name": "Primary Contact", "Value": "00000000-0000-4000-8000-000000000001", "ValueText": "A Person"},
+            {"ID": 11, "Name": "Category", "Value": "101", "ValueText": "Sample"},
+            {"ID": 12, "Name": "Stage", "Value": "Sample stage", "ValueText": "Sample stage"}
+        ]}
+        """
+        let ticket = try JSONDecoder().decode(TdxTicket.self, from: Data(json.utf8))
+        XCTAssertEqual(ticket.personAttributes.map(\.name), ["Primary Contact"])
+    }
+
+    func testGroupMemberDecodesNotificationFlag() throws {
+        let json = """
+        [{"UID": "u1", "FullName": "Member One", "PrimaryEmail": "one@example.invalid",
+          "DefaultAccountName": "Admin", "IsGroupNotified": false}]
+        """
+        let members = try JSONDecoder().decode([TdxPerson].self, from: Data(json.utf8))
+        XCTAssertEqual(members.first?.isGroupNotified, false)
+        XCTAssertEqual(members.first?.defaultAccountName, "Admin")
+    }
+}

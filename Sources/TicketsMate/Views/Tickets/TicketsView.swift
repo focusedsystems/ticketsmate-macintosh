@@ -1,0 +1,4041 @@
+import SwiftUI
+import TicketsMateCore
+
+enum TicketSortField: String, CaseIterable {
+    case id = "ID"
+    case modified = "Modified"
+    case created = "Created"
+    case age = "Age"
+    case title = "Title"
+    case status = "Status"
+    case priority = "Priority"
+    case requestor = "Requestor"
+    case responsible = "Responsible"
+}
+
+enum TicketViewMode: String, CaseIterable {
+    case table = "Table"
+    case board = "Board"
+    case inbox = "Inbox"
+}
+
+// MARK: - Date Range Preset
+
+enum DateRangePreset: Hashable {
+    case today
+    case thisWeek
+    case thisMonth
+    case lastMonth
+    case term(AcademicTerm, Int)  // term + year
+    case custom
+
+    var label: String {
+        switch self {
+        case .today: return "Today"
+        case .thisWeek: return "This Week"
+        case .thisMonth: return "This Month"
+        case .lastMonth: return "Last Month"
+        case .term(let t, let y): return "\(t.rawValue) \(y)"
+        case .custom: return "Custom"
+        }
+    }
+
+    /// Compute the date range for this preset
+    func dateRange() -> (from: Date, to: Date) {
+        let cal = Calendar.current
+        let now = Date()
+        switch self {
+        case .today:
+            let start = cal.startOfDay(for: now)
+            let end = cal.date(byAdding: .day, value: 1, to: start)!
+            return (start, end)
+        case .thisWeek:
+            let start = cal.dateInterval(of: .weekOfYear, for: now)!.start
+            let end = cal.date(byAdding: .weekOfYear, value: 1, to: start)!
+            return (start, end)
+        case .thisMonth:
+            let start = cal.dateInterval(of: .month, for: now)!.start
+            let end = cal.date(byAdding: .month, value: 1, to: start)!
+            return (start, end)
+        case .lastMonth:
+            let thisMonth = cal.dateInterval(of: .month, for: now)!.start
+            let start = cal.date(byAdding: .month, value: -1, to: thisMonth)!
+            return (start, thisMonth)
+        case .term(let term, let year):
+            return term.dateRange(year: year)
+        case .custom:
+            // Custom uses the bound date pickers directly
+            return (now, now)
+        }
+    }
+
+    /// The current academic term based on today's date
+    static var currentTerm: DateRangePreset {
+        let cal = Calendar.current
+        let now = Date()
+        let month = cal.component(.month, from: now)
+        let year = cal.component(.year, from: now)
+        let term: AcademicTerm
+        if month >= 1 && month <= 4 {
+            term = .spring
+        } else if month >= 5 && month <= 8 {
+            term = .summer
+        } else {
+            term = .fall
+        }
+        return .term(term, year)
+    }
+}
+
+enum AcademicTerm: String, CaseIterable {
+    case spring = "Spring"
+    case summer = "Summer"
+    case fall = "Fall"
+
+    func dateRange(year: Int) -> (from: Date, to: Date) {
+        let cal = Calendar.current
+        switch self {
+        case .spring:
+            let from = cal.date(from: DateComponents(year: year, month: 1, day: 1))!
+            let to = cal.date(from: DateComponents(year: year, month: 5, day: 1))!
+            return (from, to)
+        case .summer:
+            let from = cal.date(from: DateComponents(year: year, month: 5, day: 1))!
+            let to = cal.date(from: DateComponents(year: year, month: 9, day: 1))!
+            return (from, to)
+        case .fall:
+            let from = cal.date(from: DateComponents(year: year, month: 9, day: 1))!
+            let to = cal.date(from: DateComponents(year: year, month: 12, day: 31, hour: 23, minute: 59, second: 59))!
+            return (from, to)
+        }
+    }
+}
+
+struct TicketsView: View {
+    @EnvironmentObject var appState: AppState
+    @Environment(\.appFontScale) private var appFontScale
+    @Environment(\.compactModuleToolbar) private var compactToolbar
+    @State private var isLoading = false
+    /// Share of the width the ticket detail takes when it opens.
+    @State private var detailFraction = 0.5
+    /// Narrows the list to tickets the signed-in person is responsible for.
+    @AppStorage("tickets.assignedToMe") private var assignedToMe = false
+    @State private var searchText = ""
+    @State private var sortField: TicketSortField = .modified
+    @State private var sortAscending = false
+    @State private var selectedTicketIds: Set<Int?> = []
+    @State private var ticketFeed: [TdxFeedEntry] = []
+    @State private var isLoadingFeed = false
+    @State private var showClosed = false
+    @State private var meModeApplied = false
+    /// Why the last list load failed, shown in place of an empty list.
+    @State private var ticketsLoadError: String?
+
+    /// Tickets found by resolving the search text to a requestor and asking
+    /// TDX for their tickets. The loaded set is bounded by the date range and
+    /// the responsible group, so a person's tickets are routinely outside it —
+    /// filtering what is already in memory can never find them.
+    @State private var requestorHits: [TdxTicket] = []
+
+    // Date range
+    @State private var datePreset: DateRangePreset = DateRangePreset.currentTerm
+    @State private var customDateFrom: Date = Calendar.current.date(byAdding: .month, value: -1, to: Date())!
+    @State private var customDateTo: Date = Date()
+    @State private var termSeason: AcademicTerm = {
+        let month = Calendar.current.component(.month, from: Date())
+        if month >= 1 && month <= 4 { return .spring }
+        if month >= 5 && month <= 8 { return .summer }
+        return .fall
+    }()
+    @State private var termYear: Int = Calendar.current.component(.year, from: Date())
+
+    // Filter system
+    @State private var filters = FilterState<TicketFilterCategory>()
+    @State private var showFilters = false
+    @State private var allForms: [(id: Int, name: String)] = []
+
+    // Column widths
+    @State private var columnWidths: [TicketSortField: CGFloat] = [
+        .id: 130, .title: 500, .status: 110, .priority: 90,
+        .requestor: 130, .responsible: 130, .age: 70, .modified: 120, .created: 120,
+    ]
+
+    // Parent/child outline — collapsed is the exception, so an empty set means
+    // every parent starts expanded.
+    @State private var collapsedTicketIds: Set<Int> = []
+
+    private struct PendingReplyDeletion: Identifiable {
+        let parentId: Int
+        let reply: TdxFeedEntry
+        var id: Int { reply.id ?? 0 }
+    }
+
+    private struct CommentDraft: Equatable {
+        var text: String
+        var isPrivate: Bool
+        var notify: Set<String>
+        var attachments: [PendingCommentAttachment] = []
+
+        var isEmpty: Bool {
+            text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty
+        }
+    }
+
+    private var commentDraft: CommentDraft {
+        CommentDraft(text: newComment, isPrivate: isCommentPrivate, notify: notifySelection,
+                     attachments: commentAttachments)
+    }
+
+    // Comment state
+    @State private var detailLoadGate = TicketLoadGate()
+    @State private var feedLoadGate = TicketLoadGate()
+    @State private var feedLoadError: String?
+    @State private var selectionRevision = UUID()
+    @State private var commentDrafts: [Int: CommentDraft] = [:]
+    @State private var commentPostErrors: [Int: String] = [:]
+    @State private var newComment = ""
+    @State private var isCommentSectionExpanded = false
+    @State private var scrollToCommentToken = 0
+    @State private var isCommentPrivate = false
+    @State private var isAddingComment = false
+    /// Files to upload with the next comment.
+    @State private var commentAttachments: [PendingCommentAttachment] = []
+    @State private var isPickingCommentFiles = false
+    @State private var isCommentDropTargeted = false
+    /// Which upload Post is on, for the progress label ("Uploading 2 of 3…").
+    @State private var commentUploadProgress: (done: Int, total: Int)?
+    /// The top-level feed entry whose inline reply composer is open.
+    @State private var replyingToEntryId: Int?
+    /// Unsent replies, by the entry they answer. Feed entry IDs are unique
+    /// site-wide, so one ticket's drafts can't surface on another.
+    @State private var replyDrafts: [Int: FeedReplyDraft] = [:]
+    @State private var postingReplyEntryId: Int?
+    @State private var replyUploadProgress: (done: Int, total: Int)?
+    @State private var replyFocused = false
+    @State private var pendingReplyDeletion: PendingReplyDeletion?
+    /// Recipient ids (see `NotifyRecipient`) ticked for the next comment.
+    @State private var notifySelection: Set<String> = []
+
+    // People on the open ticket — contacts, responsible group members, and
+    // people held in custom attributes — all offered as notify recipients.
+    @State private var ticketContacts: [TdxPerson] = []
+    @State private var groupMembers: [TdxPerson] = []
+    @State private var groupMemberCache: [Int: [TdxPerson]] = [:]
+    @State private var attributePeople: [AttributePerson] = []
+    @State private var isPeopleExpanded = false
+    @State private var contactSearchText = ""
+    @State private var contactSearchResults: [TdxPerson] = []
+    @State private var isSearchingContact = false
+    @State private var showContactResults = false
+    @State private var isAddingContact = false
+    @State private var peopleErrorMessage: String? = nil
+
+    // Feed filter
+    @State private var feedFilter: FeedFilterType = .comments
+
+    // View mode
+    @State private var viewMode: TicketViewMode = .table
+    @State private var boardGroupBy: BoardGroupBy = .responsible
+
+    // Detail editing state
+    @State private var detailedTicket: TdxTicket? = nil
+    @State private var isLoadingDetail = false
+    @State private var ticketActivityRevision = 0
+    @State private var editTitle = ""
+    @State private var editStatusId: Int? = nil
+    @State private var editPriorityId: Int? = nil
+    @State private var editDescription = ""
+    @State private var editResponsibleGroupId: Int? = nil
+    @State private var editServiceId: Int? = nil
+    @State private var editFormId: Int? = nil
+    @State private var editRequestorUid: String? = nil
+    @State private var editRequestorName: String = ""
+    @State private var editResponsibleUid: String? = nil
+    @State private var editResponsibleName: String = ""
+    @State private var editClassification: Int? = nil
+    @State private var editTypeId: Int? = nil
+    // People search state
+    @State private var requestorSearchText = ""
+    @State private var requestorSearchResults: [TdxPerson] = []
+    @State private var isSearchingRequestor = false
+    @State private var showRequestorResults = false
+    @State private var isChangingRequestor = false
+    @State private var isReassigning = false
+    /// Which ticket-actions variant ViewThatFits is showing, so the Reassign
+    /// popover anchors to the button on screen.
+    @State private var actionsIconOnly = false
+    /// A group picked in the Reassign popover that the Group picker's options,
+    /// drawn from loaded tickets, may not include.
+    @State private var reassignedGroup: TdxLookupItem?
+    /// A row's "Reassign…" menu item selects that ticket first; this opens the
+    /// popover once its detail has loaded rather than losing it to the reset.
+    @State private var pendingReassignTicketId: Int?
+    @State private var notifyNewResponsible = true
+    // Actions menu
+    @State private var showActionsMenu = false
+    @State private var showCreateTicket = false
+    @State private var showSetParentSheet = false
+    @State private var parentTicketIdText = ""
+    @State private var isSettingParent = false
+    @State private var showCreateParentSheet = false
+    /// The ticket Set Parent or Create Parent acts on: the open one from the
+    /// detail pane, or any row from its menu before its detail has loaded.
+    @State private var parentSheetTicket: TdxTicket? = nil
+    /// Why a change made from a ticket's menu failed to save.
+    @State private var menuErrorMessage: String? = nil
+    @State private var newParentTitle = ""
+    @State private var isSaving = false
+    @State private var hasEdits = false
+    @State private var isEditingDescription = false
+    @State private var saveErrorMessage: String? = nil
+    @State private var saveSucceeded = false
+    @State private var isSavingDescription = false
+
+    @FocusState private var descriptionFocused: Bool
+    /// One-shot request to put the cursor in the comment editor.
+    @State private var commentFocused = false
+
+    var tickets: [TdxTicket] { appState.cachedTickets }
+
+    /// The selected ticket's id, known before the ticket itself is: a link
+    /// selects a ticket that may not be in the loaded list yet.
+    var selectedId: Int? { selectedTicketIds.first ?? nil }
+
+    var selectedTicket: TdxTicket? {
+        guard let id = selectedTicketIds.first, let unwrappedId = id else { return nil }
+        if detailedTicket?.id == unwrappedId { return detailedTicket }
+        return tickets.first { $0.id == unwrappedId }
+    }
+
+    // MARK: - Filter Options
+
+    /// Unique status (id, name) pairs from loaded tickets, in workflow order —
+    /// for the edit picker and the ticket menu
+    var statusIdOptions: [(id: Int, name: String)] {
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.statusId, let name = t.statusName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return TicketFieldOrder.sorted(result, by: TicketFieldOrder.status)
+    }
+
+    /// Unique priority (id, name) pairs from loaded tickets, least to most
+    /// urgent — for the edit picker and the ticket menu
+    var priorityIdOptions: [(id: Int, name: String)] {
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.priorityId, let name = t.priorityName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return TicketFieldOrder.sorted(result, by: TicketFieldOrder.priority)
+    }
+
+    /// Unique group (id, name) pairs from loaded tickets
+    var groupIdOptions: [(id: Int, name: String)] {
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.responsibleGroupId, let name = t.responsibleGroupName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return result.sorted { $0.name < $1.name }
+    }
+
+    /// Unique service (id, name) pairs from loaded tickets
+    var serviceIdOptions: [(id: Int, name: String)] {
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.serviceId, let name = t.serviceName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return result.sorted { $0.name < $1.name }
+    }
+
+    /// Unique form (id, name) pairs — prefer API-loaded forms, fallback to ticket-derived
+    var formIdOptions: [(id: Int, name: String)] {
+        if !allForms.isEmpty { return allForms }
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.formId, let name = t.formName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return result.sorted { $0.name < $1.name }
+    }
+
+    /// Unique classification (id, name) pairs from loaded tickets
+    var classificationIdOptions: [(id: Int, name: String)] {
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.classification, let name = t.classificationName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return result.sorted { $0.name < $1.name }
+    }
+
+    var statusOptions: [String] {
+        var opts = Set<String>()
+        for t in tickets {
+            if let s = t.statusName, !s.isEmpty { opts.insert(s) }
+        }
+        return ["All"] + opts.sorted()
+    }
+
+    var priorityOptions: [String] {
+        var opts = Set<String>()
+        for t in tickets {
+            if let p = t.priorityName, !p.isEmpty { opts.insert(p) }
+        }
+        return ["All"] + opts.sorted()
+    }
+
+    var groupOptions: [String] {
+        var opts = Set<String>()
+        for t in tickets {
+            if let g = t.responsibleGroupName, !g.isEmpty { opts.insert(g) }
+        }
+        return ["All"] + opts.sorted()
+    }
+
+    var responsibleOptions: [String] {
+        var opts = Set<String>()
+        for t in tickets {
+            if let r = t.responsibleFullName, !r.isEmpty { opts.insert(r) }
+        }
+        return ["All", "None"] + opts.sorted()
+    }
+
+    var formFilterOptions: [String] {
+        if !allForms.isEmpty {
+            return ["All"] + allForms.map { $0.name }
+        }
+        var opts = Set<String>()
+        for t in tickets {
+            if let f = t.formName, !f.isEmpty { opts.insert(f) }
+        }
+        return ["All"] + opts.sorted()
+    }
+
+    var classificationFilterOptions: [String] {
+        var opts = Set<String>()
+        for t in tickets {
+            if let c = t.classificationName, !c.isEmpty { opts.insert(c) }
+        }
+        return ["All"] + opts.sorted()
+    }
+
+    /// Unique type (id, name) pairs from loaded tickets
+    var typeIdOptions: [(id: Int, name: String)] {
+        var seen = Set<Int>()
+        var result: [(id: Int, name: String)] = []
+        for t in tickets {
+            if let id = t.typeId, let name = t.typeName, !name.isEmpty, !seen.contains(id) {
+                seen.insert(id)
+                result.append((id: id, name: name))
+            }
+        }
+        return result.sorted { $0.name < $1.name }
+    }
+
+    var typeFilterOptions: [String] {
+        var opts = Set<String>()
+        for t in tickets {
+            if let tn = t.typeName, !tn.isEmpty { opts.insert(tn) }
+        }
+        return ["All"] + opts.sorted()
+    }
+
+    var filteredTickets: [TdxTicket] {
+        sortedTickets(ticketsMatching(ignoring: nil))
+    }
+
+    /// The list's tickets with every filter applied except `ignored`'s
+    /// selections. The widgets count each category this way; see
+    /// TicketsWidgetsSection.
+    func ticketsMatching(ignoring ignored: TicketFilterCategory?) -> [TdxTicket] {
+        var result = tickets
+        let known = Set(result.compactMap(\.id))
+        result += requestorHits.filter { hit in hit.id.map { !known.contains($0) } ?? false }
+
+        // Show closed toggle (off by default = hide closed)
+        if !showClosed {
+            result = result.filter {
+                let s = ($0.statusName ?? "").lowercased()
+                return s != "closed" && s != "cancelled" && s != "canceled"
+            }
+        }
+
+        // Assigned to Me: the signed-in TDX person is the responsible one.
+        if assignedToMe, let me = appState.tdxMe {
+            result = result.filter { ticket in
+                if let uid = me.uid, let responsible = ticket.responsibleUid { return uid == responsible }
+                return me.fullName != nil && ticket.responsibleFullName == me.fullName
+            }
+        }
+
+        // Filter panel selections
+        if filters.hasActiveFilters {
+            result = result.filter { filters.matches($0, ignoring: ignored) }
+        }
+
+        // Text search
+        if !searchText.isEmpty {
+            result = result.filter {
+                ($0.title?.localizedCaseInsensitiveContains(searchText) ?? false) ||
+                ($0.requestorName?.localizedCaseInsensitiveContains(searchText) ?? false) ||
+                ($0.requestorEmail?.localizedCaseInsensitiveContains(searchText) ?? false) ||
+                "\($0.id ?? 0)".contains(searchText)
+            }
+        }
+
+        return result
+    }
+
+    private func sortedTickets(_ result: [TdxTicket]) -> [TdxTicket] {
+        result.sorted { a, b in
+            switch sortField {
+            case .id:
+                let aId = a.id ?? 0
+                let bId = b.id ?? 0
+                return sortAscending ? aId < bId : aId > bId
+            case .modified:
+                return compareDates(a.modifiedDate, b.modifiedDate)
+            case .created:
+                return compareDates(a.createdDate, b.createdDate)
+            case .title:
+                return compareStrings(a.title, b.title)
+            case .status:
+                return compareStrings(a.statusName, b.statusName)
+            case .priority:
+                return compareStrings(a.priorityName, b.priorityName)
+            case .requestor:
+                return compareStrings(a.requestorName, b.requestorName)
+            case .age:
+                // Oldest first when descending — a queue is read by what has
+                // been waiting longest, not by what arrived last.
+                let aAge = a.ageInDays ?? -1
+                let bAge = b.ageInDays ?? -1
+                return sortAscending ? aAge < bAge : aAge > bAge
+            case .responsible:
+                return compareStrings(a.responsibleFullName, b.responsibleFullName)
+            }
+        }
+    }
+
+    /// Tickets that have sat for weeks should read as such at a glance.
+    private func ageColor(_ days: Int?) -> Color {
+        guard let days else { return .secondary }
+        if days >= 30 { return .orange }
+        if days >= 14 { return .orange }
+        return .secondary
+    }
+
+    // MARK: - Parent/Child Outline
+
+    /// The filtered tickets arranged as parents with their children beneath.
+    var ticketTree: [TicketNode] {
+        TicketHierarchy.build(from: filteredTickets)
+    }
+
+    /// The rows the table draws — the tree flattened, minus collapsed subtrees.
+    var outlineRows: [TicketOutlineRow] {
+        TicketHierarchy.flatten(ticketTree, collapsed: collapsedTicketIds)
+    }
+
+    private var parentIds: Set<Int> {
+        TicketHierarchy.foldableIds(in: filteredTickets)
+    }
+
+    private func toggleExpansion(_ ticketId: Int) {
+        if collapsedTicketIds.contains(ticketId) {
+            collapsedTicketIds.remove(ticketId)
+        } else {
+            collapsedTicketIds.insert(ticketId)
+        }
+    }
+
+    private func expandAll() { collapsedTicketIds = [] }
+    private func collapseAll() { collapsedTicketIds = parentIds }
+
+    private func setExpanded(_ expanded: Bool, for ticketId: Int) {
+        if expanded {
+            collapsedTicketIds.remove(ticketId)
+        } else {
+            collapsedTicketIds.insert(ticketId)
+        }
+    }
+
+    // MARK: - Feed Filtering
+
+    /// Check if a feed entry looks like a status change
+    private static func isStatusChange(_ body: String) -> Bool {
+        let stripped = body.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let phrases = ["changed status", "changed the status", "moved from", "status changed"]
+        return phrases.contains { stripped.contains($0) }
+    }
+
+    /// Check if a feed entry looks like a field edit (not status change)
+    private static func isFieldEdit(_ body: String) -> Bool {
+        if isStatusChange(body) { return false }
+        let stripped = body.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let phrases = [
+            "edited this", "updated this", "changed the", "modified this",
+            "reassigned this", "set the", "cleared the", "removed the",
+            "added a task", "completed a task", "created this",
+            "attached", "unattached", "merged", "associated",
+            "escalated", "de-escalated",
+            "changed priority", "changed responsible", "changed group",
+            "changed type", "changed classification", "changed form",
+            "changed service", "was modified", "was updated",
+            "was reassigned", "was created", "was attached",
+            "moved to group", "assigned to", "unassigned from",
+            "changed from", "changed to"
+        ]
+        return phrases.contains { stripped.contains($0) }
+    }
+
+    /// Check if a feed entry body looks like any system-generated activity
+    private static func isSystemActivity(_ body: String) -> Bool {
+        return isStatusChange(body) || isFieldEdit(body)
+    }
+
+    /// Check if a feed entry is a user comment (not system-generated)
+    private static func isUserComment(_ entry: TdxFeedEntry) -> Bool {
+        // System entries are never comments
+        if entry.createdFullName == "System" { return false }
+        guard let body = entry.body, !body.isEmpty else { return false }
+        let stripped = body.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !stripped.isEmpty else { return false }
+
+        // If there are replies, this is a comment thread
+        if let replies = entry.replies, !replies.isEmpty { return true }
+
+        // Check if the body contains ONLY system-generated content.
+        // Some entries have a comment AND a status change — those should be included.
+        // Split by newlines and check if every line is a system pattern.
+        let lines = stripped.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let allLinesAreSystem = lines.allSatisfy { line in
+            let lower = line.lowercased()
+            // Field change pattern: "FieldName : OldValue → NewValue"
+            if line.contains(" : ") && line.contains(" → ") { return true }
+            if lower.contains(" changed from ") && lower.contains(" to ") { return true }
+            // Status change patterns
+            let statusPhrases = ["changed status", "changed the status", "moved from", "status changed"]
+            if statusPhrases.contains(where: { lower.contains($0) }) { return true }
+            // Field edit patterns
+            let editPhrases = [
+                "edited this", "updated this", "changed the", "modified this",
+                "reassigned this", "set the", "cleared the", "removed the",
+                "added a task", "completed a task", "created this",
+                "attached", "unattached", "merged", "associated",
+                "escalated", "de-escalated",
+                "changed priority", "changed responsible", "changed group",
+                "changed type", "changed classification", "changed form",
+                "changed service", "was modified", "was updated",
+                "was reassigned", "was created", "was attached",
+                "moved to group", "assigned to", "unassigned from"
+            ]
+            if editPhrases.contains(where: { lower.contains($0) }) { return true }
+            return false
+        }
+
+        // If all lines are system-generated, it's not a comment
+        if allLinesAreSystem { return false }
+
+        return true
+    }
+
+    var filteredFeed: [TdxFeedEntry] {
+        switch feedFilter {
+        case .comments:
+            return ticketFeed.filter { Self.isUserComment($0) }
+        case .edits:
+            return ticketFeed.filter { entry in
+                guard let body = entry.body, !body.isEmpty else { return false }
+                return Self.isFieldEdit(body)
+            }
+        case .statusChanges:
+            return ticketFeed.filter { entry in
+                guard let body = entry.body, !body.isEmpty else { return false }
+                return Self.isStatusChange(body)
+            }
+        case .all:
+            return ticketFeed
+        }
+    }
+
+    // MARK: - Body
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // No header — everything in toolbar
+            if appState.config.isTdxConfigured {
+                TicketsWidgetsSection(
+                    tickets: { ticketsMatching(ignoring: $0) },
+                    filters: filters,
+                    isLoading: isLoading
+                )
+            }
+            contentSection
+        }
+        .onChange(of: selectedTicketIds) { oldIds, newIds in
+            if let oldId = oldIds.first ?? nil {
+                commentDrafts[oldId] = commentDraft.isEmpty ? nil : commentDraft
+            }
+            let nextId = newIds.first ?? nil
+            let draft = nextId.flatMap { commentDrafts[$0] }
+            // A draft belongs to the ticket it was written on — carrying it to
+            // the next ticket risks posting it to the wrong conversation.
+            selectionRevision = UUID()
+            detailLoadGate.invalidate()
+            feedLoadGate.invalidate()
+            isLoadingDetail = false
+            isLoadingFeed = false
+            feedLoadError = nil
+            newComment = draft?.text ?? ""
+            isCommentSectionExpanded = draft != nil
+            isCommentPrivate = draft?.isPrivate ?? false
+            notifySelection = draft?.notify ?? []
+            commentAttachments = draft?.attachments ?? []
+            isCommentDropTargeted = false
+            replyingToEntryId = nil
+            pendingReplyDeletion = nil
+            saveErrorMessage = nextId.flatMap { commentPostErrors[$0] }
+            ticketContacts = []
+            groupMembers = []
+            attributePeople = []
+            peopleErrorMessage = nil
+            isAddingContact = false
+            detailedTicket = nil
+            ticketFeed = []
+            if let ticketId = newIds.first, let unwrappedId = ticketId {
+                loadTicketDetail(ticketId: unwrappedId)
+                loadTicketFeed(ticketId: unwrappedId)
+            } else {
+                detailedTicket = nil
+                ticketFeed = []
+                hasEdits = false
+            }
+        }
+        .task {
+            if !appState.isTicketsCacheValid {
+                loadTickets()
+            }
+            await appState.resolveTdxMe()
+            await loadForms()
+            if let id = appState.navigateToTicketId {
+                selectedTicketIds = [id]
+                appState.navigateToTicketId = nil
+            }
+        }
+        // A link can open the app before sign-in finishes; everything loaded
+        // up to then failed. Load it again once the session exists.
+        .onChange(of: appState.tdxSsoAuthenticated) { _, signedIn in
+            guard signedIn else { return }
+            loadTickets()
+            Task {
+                await appState.resolveTdxMe()
+                await loadForms()
+            }
+            if let id = selectedId {
+                saveErrorMessage = nil
+                loadTicketDetail(ticketId: id)
+                loadTicketFeed(ticketId: id)
+            }
+        }
+        .onChange(of: appState.navigateToTicketId) { _, newId in
+            if let id = newId {
+                selectedTicketIds = [id]
+                appState.navigateToTicketId = nil
+            }
+        }
+        .onChange(of: appState.navigateToModuleFilter) { _, _ in consumeModuleFilter() }
+        .sheet(isPresented: $showSetParentSheet) {
+            if let ticket = parentSheetTicket { setParentSheet(ticket: ticket) }
+        }
+        .sheet(isPresented: $showCreateParentSheet) {
+            if let ticket = parentSheetTicket { createParentSheet(ticket: ticket) }
+        }
+        .alert("Ticket Not Updated", isPresented: Binding(
+            get: { menuErrorMessage != nil },
+            set: { if !$0 { menuErrorMessage = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(menuErrorMessage ?? "")
+        }
+        .task { consumeModuleFilter() }
+        .onChange(of: appState.cachedTickets) { _, newTickets in
+            applyMeMode()
+            filters.buildFromTickets(newTickets)
+        }
+        // Assigned to Me is a work queue, read as a list: turning it on from
+        // the board switches back to List.
+        .onChange(of: assignedToMe) { _, isOn in
+            if isOn { viewMode = .table }
+        }
+        .onAppear {
+            applyMeMode()
+            if !tickets.isEmpty { filters.buildFromTickets(tickets) }
+        }
+        .onAppCommand { command in
+            switch command {
+            case .refresh:       refreshTickets()
+            case .newItem:       showCreateTicket = true
+            case .toggleFilters: showFilters.toggle()
+            case .clearFilters:
+                filters.clearAll()
+                showClosed = false
+                resetToCurrentTerm()
+            case .showListView:  viewMode = .table
+            case .showBoardView: viewMode = .board
+            case .showInbox:     if appState.ticketInbox.isReady { viewMode = .inbox }
+            case .find:          break  // the toolbar search field takes it
+            case .scan, .selectOnline: break
+            }
+        }
+        .tabSearch(text: $searchText, prompt: "Search tickets or requestor...")
+        .task(id: searchText) { await resolveRequestorHits() }
+        .toolbar {
+            ToolbarItemGroup(placement: .navigation) {
+                ViewModePill(selection: $viewMode, inbox: appState.ticketInbox)
+
+                if viewMode == .board {
+                    // A menu-style Picker in the toolbar draws an empty
+                    // capsule once a value is chosen, so the menu carries its
+                    // own label naming the current grouping, with the choices
+                    // inside as a checked list.
+                    Menu {
+                        Picker("Group by", selection: $boardGroupBy) {
+                            ForEach(BoardGroupBy.allCases, id: \.self) { option in
+                                Text(option.rawValue).tag(option)
+                            }
+                        }
+                        .pickerStyle(.inline)
+                    } label: {
+                        Text(boardGroupBy.rawValue)
+                    }
+                    // No fixed width: a capsule wider than the menu's own
+                    // bounds leaves a hover highlight that doesn't reach the
+                    // capsule's edges.
+                    .fixedSize()
+                    .help("Group board columns by \(boardGroupBy.rawValue.lowercased())")
+                    .accessibilityLabel("Group by")
+                    .accessibilityValue(boardGroupBy.rawValue)
+                }
+
+                // No expand/collapse-all button here on purpose. Finder, Xcode,
+                // and Mail keep outline folding on the outline itself:
+                // option-click a triangle, arrow keys, and a context menu. A
+                // toolbar button for it is chrome those apps deliberately
+                // don't spend. See `expandAll` / `collapseAll` below.
+
+                if filters.hasActiveFilters || showClosed || !isDefaultDatePreset {
+                    Button(action: {
+                        filters.clearAll()
+                        showClosed = false
+                        resetToCurrentTerm()
+                    }) {
+                        Label("Clear Filters", systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.yellow)
+                    }
+                }
+
+                Toggle(isOn: $assignedToMe) {
+                    Label("Assigned to Me", systemImage: assignedToMe ? "person.crop.circle.fill" : "person.crop.circle")
+                        .labelStyle(AdaptiveLabelStyle(iconOnly: compactToolbar))
+                        // No foreground colour of our own: depending on the
+                        // Mac's appearance settings the "on" bezel is grey or
+                        // filled with the accent colour, and an accent label on
+                        // an accent bezel is unreadable. The system picks a
+                        // label colour that contrasts with its own bezel, and
+                        // the filled icon still marks the list as yours.
+                }
+                .toggleStyle(.button)
+                .disabled(appState.tdxMe == nil)
+                .help(appState.tdxMe == nil
+                      ? "Waiting to identify you in TeamDynamix"
+                      : "Show only tickets you are responsible for")
+
+                Button(action: { showFilters.toggle() }) {
+                    Label("Filters", systemImage: filters.hasActiveFilters
+                        ? "line.3.horizontal.decrease.circle.fill"
+                        : "line.3.horizontal.decrease.circle")
+                }
+                .popover(isPresented: $showFilters, arrowEdge: .bottom) {
+                    FilterPanelView(filters: filters)
+                }
+
+                Button(action: { showCreateTicket = true }) {
+                    Label("Create Ticket", systemImage: "plus")
+                }
+                .help("Create a ticket")
+                .popover(isPresented: $showCreateTicket, arrowEdge: .bottom) {
+                    CreateTicketView(
+                        defaultResponsible: appState.tdxMe,
+                        onCreated: { ticket in
+                            showCreateTicket = false
+                            loadTickets()
+                            if let id = ticket.id { selectedTicketIds = [id] }
+                        },
+                        onCancel: { showCreateTicket = false }
+                    )
+                    .environmentObject(appState)
+                }
+
+                Button(action: refreshTickets) {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(isLoading)
+            }
+        }
+    }
+
+
+    @ViewBuilder
+    private var ssoSection: some View {
+        if appState.tdxSsoAuthenticated, let userName = appState.tdxAuthenticatedUserName {
+            HStack(spacing: 6) {
+                Image(systemName: "person.circle.fill")
+                    .foregroundColor(.secondary)
+                Text(userName)
+                    .appFont(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.secondary.opacity(0.08))
+            .cornerRadius(6)
+        } else if appState.tdxService.shouldAttemptSso {
+            Button(action: { appState.triggerTdxSsoLogin() }) {
+                Label("Sign In", systemImage: "person.badge.key")
+            }
+            .help("Sign in with SSO to perform actions as yourself")
+        }
+    }
+
+    // MARK: - Content Section
+
+    @ViewBuilder
+    private var contentSection: some View {
+        if appState.config.isTdxConfigured && viewMode == .inbox && appState.ticketInbox.isReady {
+            ticketsInboxView
+        } else if !appState.config.isTdxConfigured {
+            VStack {
+                ContentUnavailableView(
+                    "Not Configured",
+                    systemImage: "gear.badge.xmark",
+                    description: Text("TeamDynamix is not configured. Set TDX_BASE_URL and TDX_APP_ID in your config.")
+                )
+                Spacer()
+            }
+        } else if let stage = appState.tdxSignInStage, appState.cachedTickets.isEmpty {
+            VStack(spacing: 8) {
+                ProgressView(value: stage.fraction)
+                    .frame(width: 280)
+                    .animation(.easeInOut(duration: 0.3), value: stage)
+                Text(stage.label)
+                    .appFont(.callout)
+                    .foregroundColor(.secondary)
+                Spacer()
+            }
+            .padding(.top, 60)
+            .frame(maxWidth: .infinity)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Signing in: \(stage.label)")
+        } else if isLoading && filteredTickets.isEmpty && selectedId == nil {
+            VStack {
+                ProgressView("Loading tickets...")
+                    .padding(.top, 50)
+                Spacer()
+            }
+        } else if appState.cachedTickets.isEmpty, selectedId == nil, let error = ticketsLoadError {
+            ticketsUnavailableView(error: error)
+        } else if filteredTickets.isEmpty && selectedId == nil {
+            noMatchingTicketsView
+        } else {
+            switch viewMode {
+            case .table:
+                ticketsTableView
+            case .board:
+                ticketsBoardView
+            case .inbox:
+                ticketsInboxView
+            }
+        }
+    }
+
+    // MARK: - Table + Detail (50/50)
+
+    /// The list couldn't load. Before sign-in that's expected, so say so and
+    /// offer the way in rather than an empty search result.
+    private func ticketsUnavailableView(error: String) -> some View {
+        VStack {
+            ContentUnavailableView {
+                Label(appState.tdxSsoAuthenticated ? "Tickets Didn't Load" : "Not Signed In",
+                      systemImage: appState.tdxSsoAuthenticated ? "exclamationmark.triangle" : "person.crop.circle.badge.exclamationmark")
+            } description: {
+                Text(appState.tdxSsoAuthenticated ? error : "Sign in to TeamDynamix to see tickets.")
+            } actions: {
+                if !appState.tdxSsoAuthenticated {
+                    Button("Sign In") { appState.triggerTdxSsoLogin() }
+                        .buttonStyle(.borderedProminent)
+                }
+                Button("Try Again") { loadTickets() }
+            }
+            .padding(.top, 30)
+            Spacer()
+        }
+    }
+
+    /// Nothing passes the search or filters. Say which, and offer the way back.
+    @ViewBuilder
+    private var noMatchingTicketsView: some View {
+        VStack {
+            if !searchText.isEmpty {
+                ContentUnavailableView.search(text: searchText)
+            } else {
+                ContentUnavailableView {
+                    Label("No Matching Tickets", systemImage: "line.3.horizontal.decrease.circle")
+                } description: {
+                    Text(assignedToMe ? "No open tickets are assigned to you." : "No tickets match the current filters.")
+                } actions: {
+                    if assignedToMe {
+                        Button("Show All Tickets") { assignedToMe = false }
+                    }
+                    if filters.hasActiveFilters || showClosed || !isDefaultDatePreset {
+                        Button("Clear Filters") {
+                            filters.clearAll()
+                            showClosed = false
+                            resetToCurrentTerm()
+                        }
+                    }
+                }
+            }
+            Spacer()
+        }
+        .padding(.top, 30)
+    }
+
+    private var ticketsTableView: some View {
+        DetailSplitView(fraction: $detailFraction, showsDetail: selectedTicket != nil) {
+            ticketTableContent
+        } trailing: {
+            detailSidebarView
+                .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    // MARK: - Inbox + Detail
+
+    private var ticketsInboxView: some View {
+        DetailSplitView(fraction: $detailFraction, showsDetail: selectedTicket != nil) {
+            TicketInboxView(
+                inbox: appState.ticketInbox,
+                onRefresh: { startInbox(scanNow: true) },
+                onSelect: { item in selectedTicketIds = [item.ticketId] }
+            )
+        } trailing: {
+            detailSidebarView
+                .background(Color(nsColor: .windowBackgroundColor))
+        }
+        .task(id: appState.tdxMe?.uid) { startInbox(scanNow: false) }
+    }
+
+    /// Start the inbox once the signed-in person is known. It keeps
+    /// refreshing on its own after that.
+    private func startInbox(scanNow: Bool) {
+        guard let me = appState.tdxMe else {
+            Task { await appState.resolveTdxMe() }
+            return
+        }
+        appState.ticketInbox.start(service: appState.tdxService, me: me)
+        if scanNow { appState.ticketInbox.scan(service: appState.tdxService, me: me) }
+    }
+
+    // MARK: - Board + Detail
+
+    private var ticketsBoardView: some View {
+        // Each pane is clipped, so the board's greedy horizontal ScrollView
+        // and the detail never spill past the divider.
+        DetailSplitView(fraction: $detailFraction, showsDetail: selectedTicket != nil) {
+            ticketBoardContent
+        } trailing: {
+            detailSidebarView
+                .background(Color(nsColor: .windowBackgroundColor))
+        }
+    }
+
+    private var ticketBoardContent: some View {
+        let statuses: [Int: String] = {
+            var map = [Int: String]()
+            for ticket in filteredTickets {
+                if let statusId = ticket.statusId, let statusName = ticket.statusName {
+                    map[statusId] = statusName
+                }
+            }
+            return map
+        }()
+        
+        return TicketBoardView(
+            tickets: filteredTickets,
+            statuses: statuses,
+            groupBy: boardGroupBy,
+            onDropTicket: { ticketId, targetColumnKey in
+                handleBoardDrop(ticketId: ticketId, targetColumnKey: targetColumnKey)
+            },
+            onSelectTicket: { ticket in
+                selectedTicketIds = [ticket.id]
+            },
+            selectedTicketId: selectedId,
+            collapsedTicketIds: $collapsedTicketIds,
+            ticketMenu: { AnyView(ticketContextMenu($0)) }
+        )
+    }
+
+    /// Column definitions for the ticket table
+    private var ticketColumns: [(title: String, field: TicketSortField)] {
+        [
+            ("ID", .id), ("Title", .title), ("Status", .status), ("Priority", .priority),
+            ("Requestor", .requestor), ("Responsible", .responsible),
+            ("Age", .age), ("Modified", .modified), ("Created", .created),
+        ]
+    }
+
+    private func colW(_ field: TicketSortField) -> CGFloat {
+        columnWidths[field] ?? 100
+    }
+
+    private var ticketTableContent: some View {
+        GeometryReader { geo in
+            let totalW = ticketColumns.reduce(CGFloat(0)) { $0 + colW($1.field) }
+            let minW = max(totalW, geo.size.width)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                VStack(spacing: 0) {
+                    // Sortable column headers with resize handles
+                    HStack(spacing: 0) {
+                        ForEach(ticketColumns, id: \.field) { col in
+                            HStack(spacing: 0) {
+                                sortableColumnHeader(col.title, field: col.field, width: colW(col.field))
+                                TicketColumnResizeHandle(field: col.field, columnWidths: $columnWidths)
+                            }
+                            .frame(width: colW(col.field))
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(minWidth: minW)
+                    .frame(height: 32)
+                    .padding(.leading, 8)
+                    .background(Color.secondary.opacity(0.08))
+
+                    Divider()
+
+                    // Ticket rows
+                    ScrollView(.vertical, showsIndicators: true) {
+                        LazyVStack(spacing: 0) {
+                            ForEach(Array(outlineRows.enumerated()), id: \.element.id) { idx, row in
+                                let ticket = row.ticket
+                                HStack(spacing: 0) {
+                                    HStack(spacing: 2) {
+                                        Spacer().frame(width: CGFloat(row.depth) * 14)
+                                        disclosureControl(for: row)
+                                        Text(verbatim: "#\(ticket.id ?? 0)")
+                                            .appFont(.body, design: .monospaced)
+                                        Spacer(minLength: 0)
+                                    }
+                                    .frame(width: colW(.id) - 12, alignment: .leading)
+                                    .padding(.leading, 10).padding(.trailing, 2)
+                                    HStack(spacing: 6) {
+                                        Text(ticket.title ?? "-")
+                                            .lineLimit(1)
+                                        if row.hasChildren {
+                                            Text(verbatim: "\(row.childCount)")
+                                                .appFont(.caption2)
+                                                .padding(.horizontal, 5)
+                                                .padding(.vertical, 1)
+                                                .background(Color.secondary.opacity(0.18))
+                                                .foregroundColor(.secondary)
+                                                .clipShape(Capsule())
+                                        }
+                                        Spacer(minLength: 0)
+                                    }
+                                    .frame(width: colW(.title) - 12, alignment: .leading)
+                                    .padding(.leading, 10).padding(.trailing, 2)
+                                    TicketStatusBadge(statusName: ticket.statusName)
+                                        .frame(width: colW(.status) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                    Text(ticket.priorityName ?? "-")
+                                        .frame(width: colW(.priority) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                    Text(ticket.requestorName ?? "-")
+                                        .frame(width: colW(.requestor) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                        .lineLimit(1)
+                                    Text(ticket.responsibleFullName ?? "-")
+                                        .frame(width: colW(.responsible) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                        .lineLimit(1)
+                                    Text(ticket.ageLabel)
+                                        .frame(width: colW(.age) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                        .appFont(.body, design: .monospaced)
+                                        .foregroundColor(ageColor(ticket.ageInDays))
+                                    Text(formatDateString(ticket.modifiedDate))
+                                        .frame(width: colW(.modified) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                        .appFont(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text(formatDateString(ticket.createdDate))
+                                        .frame(width: colW(.created) - 12, alignment: .leading)
+                                        .padding(.leading, 10).padding(.trailing, 2)
+                                        .appFont(.caption)
+                                        .foregroundColor(.secondary)
+                                    Spacer(minLength: 0)
+                                }
+                                .frame(minWidth: minW)
+                                .frame(height: 28)
+                                .background(
+                                    selectedTicket?.id == ticket.id
+                                        ? Color.accentColor.opacity(0.2)
+                                        : (idx % 2 == 1 ? Color.secondary.opacity(0.04) : Color.clear)
+                                )
+                                .contentShape(Rectangle())
+                                .contextMenu {
+                                    ticketContextMenu(ticket)
+                                    Divider()
+                                    outlineContextMenu
+                                }
+                                .onTapGesture {
+                                    if let id = ticket.id {
+                                        selectedTicketIds = [id]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .frame(height: max(100, geo.size.height - 33))
+                    .frame(minWidth: minW)
+                }
+            }
+            .focusable()
+            // Keep keyboard focus for arrow-key navigation but drop the blue
+            // macOS focus ring, whose right edge showed as a vertical bar against
+            // the detail pane.
+            .focusEffectDisabled()
+            .onKeyPress(.upArrow) { moveTicketSelection(by: -1); return .handled }
+            .onKeyPress(.downArrow) { moveTicketSelection(by: 1); return .handled }
+            // Left/right fold the selected row, as in any macOS outline.
+            .onKeyPress(.rightArrow) { foldSelection(expanded: true); return .handled }
+            .onKeyPress(.leftArrow) { foldSelection(expanded: false); return .handled }
+        }
+    }
+
+    /// The fold/unfold triangle in front of a parent's ticket number. Children
+    /// and childless tickets get an equally wide blank so the numbers line up.
+    ///
+    /// Option-clicking applies the new state to every parent, the way Finder
+    /// and Xcode do — which is why there is no toolbar button for it.
+    @ViewBuilder
+    private func disclosureControl(for row: TicketOutlineRow) -> some View {
+        if row.hasChildren {
+            Button(action: {
+                if NSEvent.modifierFlags.contains(.option) {
+                    if row.isExpanded { collapseAll() } else { expandAll() }
+                } else {
+                    toggleExpansion(row.id)
+                }
+            }) {
+                Image(systemName: "chevron.right")
+                    .appFont(.caption2)
+                    .foregroundColor(.secondary)
+                    .rotationEffect(.degrees(row.isExpanded ? 90 : 0))
+                    .frame(width: 12, height: 12)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .animation(.easeInOut(duration: 0.15), value: row.isExpanded)
+            .help(row.isExpanded
+                  ? "Hide \(row.childCount) child ticket\(row.childCount == 1 ? "" : "s") — ⌥ click for all"
+                  : "Show \(row.childCount) child ticket\(row.childCount == 1 ? "" : "s") — ⌥ click for all")
+        } else {
+            Spacer().frame(width: 12)
+        }
+    }
+
+    /// Everything the detail pane does to a ticket, on its row and its board
+    /// card, so a ticket can be worked without opening it. Assignment, status
+    /// and priority save at once, the way a board drag does; on the open
+    /// ticket they wait while its own edits are unsaved, so neither change
+    /// overwrites the other.
+    @ViewBuilder
+    private func ticketContextMenu(_ ticket: TdxTicket) -> some View {
+        let id = ticket.id ?? 0
+        let link = appState.config.tdxTicketWebUrl(id)
+        let myUid = appState.tdxMe?.uid
+        let isAssigned = !(ticket.responsibleUid ?? "").isEmpty
+        let editsPending = hasEdits && selectedTicket?.id == ticket.id
+
+        Button {
+            if let url = URL(string: appState.config.tdxTicketBrowserUrl(id)) { NSWorkspace.shared.open(url) }
+        } label: {
+            Label("Open in TeamDynamix", systemImage: "globe")
+        }
+        Button { copyToPasteboard("\(id)") } label: {
+            Label("Copy Ticket Number", systemImage: "number")
+        }
+        Button { copyToPasteboard(link) } label: {
+            Label("Copy Link", systemImage: "link")
+        }
+        Button { copyToPasteboard(ticket.title ?? "") } label: {
+            Label("Copy Title", systemImage: "textformat")
+        }
+        .disabled((ticket.title ?? "").isEmpty)
+
+        Divider()
+
+        Button {
+            if let myUid { updateFromMenu(ticket, ["ResponsibleUid": myUid]) }
+        } label: {
+            Label("Assign to Me", systemImage: "person.fill")
+        }
+        .disabled(myUid == nil || ticket.responsibleUid == myUid || editsPending)
+        Button {
+            if selectedId == ticket.id {
+                isReassigning = true
+            } else {
+                pendingReassignTicketId = ticket.id
+                selectedTicketIds = [ticket.id]
+            }
+        } label: {
+            Label("Reassign…", systemImage: "person.2.fill")
+        }
+        Button {
+            updateFromMenu(ticket, ["ResponsibleUid": ""])
+        } label: {
+            Label("Unassign", systemImage: "person.fill.xmark")
+        }
+        .disabled(!isAssigned || editsPending)
+
+        Picker(selection: Binding(
+            get: { ticket.statusId ?? 0 },
+            set: { updateFromMenu(ticket, ["StatusID": $0]) }
+        )) {
+            ForEach(statusIdOptions, id: \.id) { option in
+                Text(option.name).tag(option.id)
+            }
+        } label: {
+            Label("Status", systemImage: "circle.dotted")
+        }
+        .pickerStyle(.menu)
+        .disabled(statusIdOptions.isEmpty || editsPending)
+        Picker(selection: Binding(
+            get: { ticket.priorityId ?? 0 },
+            set: { updateFromMenu(ticket, ["PriorityID": $0]) }
+        )) {
+            ForEach(priorityIdOptions, id: \.id) { option in
+                Text(option.name).tag(option.id)
+            }
+        } label: {
+            Label("Priority", systemImage: "flag")
+        }
+        .pickerStyle(.menu)
+        .disabled(priorityIdOptions.isEmpty || editsPending)
+
+        Divider()
+
+        Button {
+            selectedTicketIds = [ticket.id]
+            parentSheetTicket = ticket
+            showSetParentSheet = true
+        } label: {
+            Label("Set Parent…", systemImage: "arrow.up.doc")
+        }
+        Button {
+            selectedTicketIds = [ticket.id]
+            parentSheetTicket = ticket
+            newParentTitle = ticket.title ?? ""
+            showCreateParentSheet = true
+        } label: {
+            Label("Create Parent…", systemImage: "plus.rectangle.on.rectangle")
+        }
+        Button {
+            loadTickets()
+            if selectedTicket?.id == ticket.id {
+                loadTicketDetail(ticketId: id)
+                loadTicketFeed(ticketId: id)
+            }
+        } label: {
+            Label("Refresh", systemImage: "arrow.clockwise")
+        }
+
+    }
+
+    private func copyToPasteboard(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Saves a change made from a ticket's menu straight away, then refreshes
+    /// the list and, when it is the open ticket, its detail.
+    private func updateFromMenu(_ ticket: TdxTicket, _ changes: [String: Any]) {
+        guard let ticketId = ticket.id else { return }
+        Task {
+            do {
+                _ = try await appState.tdxService.updateTicket(id: ticketId, updates: changes)
+                loadTickets()
+                if selectedTicket?.id == ticketId { loadTicketDetail(ticketId: ticketId) }
+            } catch {
+                menuErrorMessage = "Ticket #\(ticketId) was not updated: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Right-click folding, for people who don't know about ⌥ click.
+    @ViewBuilder
+    private var outlineContextMenu: some View {
+        Button("Expand All", action: expandAll)
+            .disabled(collapsedTicketIds.isEmpty)
+        Button("Collapse All", action: collapseAll)
+            .disabled(parentIds.isSubset(of: collapsedTicketIds))
+    }
+
+    /// Fold or unfold the selected row. On a row that can't fold, left arrow
+    /// jumps to its parent instead — again matching Finder.
+    private func foldSelection(expanded: Bool) {
+        guard let selectedId = selectedTicketIds.first ?? nil else { return }
+        guard let row = outlineRows.first(where: { $0.id == selectedId }) else { return }
+
+        if row.hasChildren {
+            setExpanded(expanded, for: selectedId)
+        } else if !expanded, let parentId = row.ticket.parentTicketId {
+            selectedTicketIds = [parentId]
+        }
+    }
+
+    private func moveTicketSelection(by offset: Int) {
+        let list = outlineRows.map(\.ticket)
+        guard !list.isEmpty else { return }
+        guard let currentId = selectedTicketIds.first ?? nil,
+              let currentIndex = list.firstIndex(where: { $0.id == currentId }) else {
+            if let firstId = list.first?.id { selectedTicketIds = [firstId] }
+            return
+        }
+        let newIndex = min(max(currentIndex + offset, 0), list.count - 1)
+        if let newId = list[newIndex].id {
+            selectedTicketIds = [newId]
+        }
+    }
+
+    /// Build a clickable sortable column header
+    private func sortableColumnHeader(_ title: String, field: TicketSortField, width: CGFloat) -> some View {
+        Button(action: { toggleSort(field) }) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.primary)
+                if sortField == field {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .appFont(.caption2)
+                        .foregroundColor(.accentColor)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, 10)
+            .padding(.trailing, 2)
+            .frame(width: max(0, width - 10), height: 32, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(sortField == field ? (sortAscending ? "Ascending" : "Descending") : "Not sorted")
+    }
+
+    /// Toggle sort on a column
+    private func toggleSort(_ field: TicketSortField) {
+        if sortField == field {
+            sortAscending.toggle()
+        } else {
+            sortField = field
+            sortAscending = true
+        }
+    }
+
+    // MARK: - Detail Sidebar (single view, no tabs)
+
+    @ViewBuilder
+    private var detailSidebarView: some View {
+        if isLoadingDetail && detailedTicket == nil {
+            VStack {
+                Spacer()
+                ProgressView("Loading ticket...")
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let ticket = selectedTicket {
+            // The title and field grid stay frozen; everything content-sized —
+            // description, attachments, comment box, feed — scrolls. Keeping
+            // the description pinned meant capping its height, and a capped
+            // description reads as cut off. The activity filter re-pins itself
+            // as a sticky section header once the feed reaches the top.
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    detailHeader(ticket: ticket)
+                    Divider()
+                    Spacer().frame(height: 10)
+                    detailFields(ticket: ticket)
+                    Divider().padding(.top, 10)
+                }
+                .padding([.horizontal, .top])
+
+                ScrollViewReader { proxy in
+                    ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 0, pinnedViews: [.sectionHeaders]) {
+                        descriptionSection(ticket: ticket)
+                            .padding(.top, 10)
+                        // Accordions: Attachments, People, Workflow, Tasks,
+                        // then the Activity feed.
+                        if !ticket.attachmentList.isEmpty {
+                            Divider().padding(.vertical, 8)
+                            TicketAttachmentsView(attachments: ticket.attachmentList)
+                        }
+                        Divider().padding(.vertical, 8)
+                        peopleSection(ticket: ticket)
+                        if let ticketId = ticket.id {
+                            Divider().padding(.vertical, 8)
+                            // One container so the Workflow and Tasks rows
+                            // share a button width and their buttons line up.
+                            VStack(alignment: .leading, spacing: 0) {
+                                TicketWorkflowView(ticketId: ticketId, service: appState.tdxService, refreshToken: ticketActivityRevision) {
+                                    guard selectedTicket?.id == ticketId else { return }
+                                    loadTicketDetail(ticketId: ticketId)
+                                    loadTicketFeed(ticketId: ticketId)
+                                    loadTickets()
+                                }
+                                .id("workflow-\(ticketId)")
+                                Divider().padding(.vertical, 8)
+                                TicketTasksView(ticketId: ticketId, service: appState.tdxService,
+                                                refreshToken: ticketActivityRevision) {
+                                    guard selectedTicket?.id == ticketId else { return }
+                                    loadTicketDetail(ticketId: ticketId)
+                                    loadTicketFeed(ticketId: ticketId)
+                                    loadTickets()
+                                }
+                                .id("tasks-\(ticketId)")
+                            }
+                            .sharedButtonWidthGroup()
+                        }
+                        Section {
+                            // The compose space opens here, under the Activity
+                            // bar's Add Comment button, above the feed it adds to.
+                            if isCommentSectionExpanded {
+                                addCommentSection(ticket: ticket)
+                                    .id("addComment")
+                                    .padding(.top, 10)
+                                Divider().padding(.top, 10)
+                            }
+                            activityFeed
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 10)
+                                .padding(.bottom)
+                        } header: {
+                            VStack(alignment: .leading, spacing: 0) {
+                                Divider().padding(.bottom, 8)
+                                activityHeader
+                                Divider().padding(.top, 10)
+                            }
+                            .padding(.top, 8)
+                            .background(Color(nsColor: .windowBackgroundColor))
+                        }
+                    }
+                    .padding(.horizontal)
+                    }
+                    .onChange(of: scrollToCommentToken) { _, _ in
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo("addComment", anchor: .top)
+                        }
+                    }
+                }
+            }
+        } else {
+            VStack {
+                Spacer()
+                Image(systemName: "ticket")
+                    .font(.system(size: 40))
+                    .foregroundColor(.secondary.opacity(0.5))
+                    .padding(.bottom, 8)
+                Text("No Ticket Selected")
+                    .appFont(.headline)
+                    .foregroundColor(.secondary)
+                Text("Select a ticket to view details")
+                    .appFont(.subheadline)
+                    .foregroundColor(.secondary.opacity(0.7))
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    // MARK: - Detail Header
+
+    private func detailHeader(ticket: TdxTicket) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                // Collapse the detail pane; the chevron points the way it goes.
+                Button {
+                    selectedTicketIds = []
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .appFont(.body, weight: .semibold)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.escape, modifiers: [])
+                .help("Close the ticket (Esc)")
+
+                // Ticket number - click to copy
+                Button(action: {
+                    let ticketNum = "\(ticket.id ?? 0)"
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(ticketNum, forType: .string)
+                }) {
+                    Text(verbatim: "#\(ticket.id ?? 0)")
+                        .appFont(.title2)
+                        .fontWeight(.bold)
+                        .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("Click to copy ticket number")
+                
+                // Copy link button
+                Button(action: {
+                    let url = appState.config.tdxTicketWebUrl(ticket.id ?? 0)
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url, forType: .string)
+                }) {
+                    Image(systemName: "link")
+                        .appFont(.body)
+                }
+                .buttonStyle(.plain)
+                .help("Copy ticket link")
+                
+                // Open in web button
+                Button(action: {
+                    let urlStr = appState.config.tdxTicketBrowserUrl(ticket.id ?? 0)
+                    if let url = URL(string: urlStr) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }) {
+                    Image(systemName: "globe")
+                        .appFont(.body)
+                }
+                .buttonStyle(.plain)
+                .help("Open ticket in web browser")
+
+                
+                Spacer()
+
+                if hasEdits {
+                    Button(action: { discardEdits(ticket: ticket) }) {
+                        Text("Discard")
+                            .appFont(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.red.opacity(0.7))
+                    .controlSize(.small)
+                    .help("Discard changes")
+
+                    Button(action: { saveTicket(ticket: ticket) }) {
+                        if isSaving {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Label("Save", systemImage: "checkmark.circle.fill")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(.green)
+                    .controlSize(.small)
+                    .disabled(isSaving)
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .help("Save changes (⌘↩)")
+                }
+
+                if saveSucceeded {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                        .help("Saved")
+                }
+
+                // Every ticket action sits on the number row, so the field
+                // grid below holds only fields. Labels drop to icons when the
+                // detail pane is too narrow for them.
+                ViewThatFits(in: .horizontal) {
+                    ticketActions(ticket: ticket, iconOnly: false)
+                    ticketActions(ticket: ticket, iconOnly: true)
+                }
+            }
+
+            // Editable title
+            TextField("Title", text: $editTitle)
+                .appFont(.title3)
+                .fontWeight(.semibold)
+                .textFieldStyle(.plain)
+                .onChange(of: editTitle) { _, _ in trackEdits(ticket: ticket) }
+
+            Divider()
+
+            if let errMsg = saveErrorMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text(errMsg)
+                        .appFont(.caption)
+                        .foregroundColor(.orange)
+                    Spacer()
+                    Button(action: { saveErrorMessage = nil }) {
+                        Image(systemName: "xmark")
+                            .appFont(.caption2)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(6)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(6)
+            }
+        }
+        .padding(.bottom, 8)
+    }
+
+    /// Assign to me, Reassign, Unassign, Set Parent, Create Parent and Refresh,
+    /// in the order they appear on the ticket number row.
+    private func ticketActions(ticket: TdxTicket, iconOnly: Bool) -> some View {
+        HStack(spacing: 6) {
+            // Resolved from the signed-in Azure identity, not from the TDX
+            // session — the Web API always authenticates as the service
+            // account, so gating this on TDX SSO hid it permanently.
+            Button(action: {
+                guard let me = appState.tdxMe, let myUid = me.uid else { return }
+                editResponsibleUid = myUid
+                editResponsibleName = me.fullName ?? ""
+                isReassigning = false
+                trackEdits(ticket: ticket)
+            }) {
+                Label("Assign to me", systemImage: "person.fill")
+            }
+            .disabled(appState.tdxMe?.uid == nil || editResponsibleUid == appState.tdxMe?.uid)
+            .help("Make yourself the responsible person")
+
+            Button(action: {
+                isReassigning.toggle()
+            }) {
+                Label("Reassign", systemImage: "person.2.fill")
+            }
+            .help("Choose a different responsible person or group")
+            // Only the variant ViewThatFits is showing presents the popover,
+            // so it anchors to the Reassign button actually on screen.
+            .popover(isPresented: Binding(
+                get: { isReassigning && actionsIconOnly == iconOnly },
+                set: { if !$0 { isReassigning = false } }
+            ), arrowEdge: .bottom) {
+                TicketReassignPopover(
+                    service: appState.tdxService,
+                    currentResponsibleUid: editResponsibleUid,
+                    currentGroupId: editResponsibleGroupId ?? ticket.responsibleGroupId,
+                    notifyNewResponsible: $notifyNewResponsible
+                ) { candidate in
+                    applyReassignment(candidate, ticket: ticket)
+                }
+            }
+
+            Button(action: {
+                editResponsibleUid = nil
+                editResponsibleName = ""
+                isReassigning = false
+                trackEdits(ticket: ticket)
+            }) {
+                Label("Unassign", systemImage: "person.fill.xmark")
+            }
+            .disabled(editResponsibleUid == nil)
+            .help("Clear the responsible person")
+
+            Button(action: {
+                parentSheetTicket = ticket
+                showSetParentSheet = true
+            }) {
+                Label("Set Parent", systemImage: "arrow.up.doc")
+            }
+            .help("Set parent ticket")
+
+            Button(action: {
+                parentSheetTicket = ticket
+                newParentTitle = ticket.title ?? ""
+                showCreateParentSheet = true
+            }) {
+                Label("Create Parent", systemImage: "plus.rectangle.on.rectangle")
+            }
+            .help("Create parent ticket")
+
+            Button(action: {
+                loadTicketDetail(ticketId: ticket.id ?? 0)
+                loadTicketFeed(ticketId: ticket.id ?? 0)
+            }) {
+                Label("Refresh", systemImage: "arrow.clockwise")
+            }
+            .help("Refresh ticket")
+        }
+        .labelStyle(AdaptiveLabelStyle(iconOnly: iconOnly))
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .fixedSize()
+        .onAppear { actionsIconOnly = iconOnly }
+    }
+
+    /// Make the chosen candidate the responsible. A group takes the ticket on
+    /// its own, as TDX's picker does: the group becomes responsible and the
+    /// responsible person is cleared.
+    private func applyReassignment(_ candidate: TdxEligibleAssignment, ticket: TdxTicket) {
+        if candidate.isUser {
+            editResponsibleUid = candidate.value
+            editResponsibleName = candidate.name
+        } else if let groupId = candidate.groupId {
+            reassignedGroup = TdxLookupItem(id: groupId, name: candidate.name)
+            editResponsibleGroupId = groupId
+            editResponsibleUid = nil
+            editResponsibleName = ""
+        }
+        isReassigning = false
+        trackEdits(ticket: ticket)
+    }
+
+    // MARK: - Detail Fields
+
+    private func detailFields(ticket: TdxTicket) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            // Two columns: left = the ticket's own editable fields, right = the
+            // people on it and its timestamps.
+            HStack(alignment: .top, spacing: 16) {
+                // LEFT COLUMN — editable fields
+                VStack(alignment: .leading, spacing: 10) {
+                    fieldRow(label: "Status") {
+                        Picker("", selection: Binding(
+                            get: { editStatusId ?? ticket.statusId ?? 0 },
+                            set: { editStatusId = $0; hasEdits = true }
+                        )) {
+                            ForEach(statusIdOptions, id: \.id) { option in
+                                Text(option.name).tag(option.id)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    fieldRow(label: "Priority") {
+                        Picker("", selection: Binding(
+                            get: { editPriorityId ?? ticket.priorityId ?? 0 },
+                            set: { editPriorityId = $0; hasEdits = true }
+                        )) {
+                            ForEach(priorityIdOptions, id: \.id) { option in
+                                Text(option.name).tag(option.id)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    fieldRow(label: "Classification") {
+                        Picker("", selection: Binding(
+                            get: { editClassification ?? ticket.classification ?? 0 },
+                            set: { editClassification = $0; trackEdits(ticket: ticket) }
+                        )) {
+                            Text("None").tag(0)
+                            ForEach(classificationIdOptions, id: \.id) { option in
+                                Text(option.name).tag(option.id)
+                            }
+                            if let cid = ticket.classification, let cname = ticket.classificationName,
+                               !classificationIdOptions.contains(where: { $0.id == cid }) {
+                                Text(cname).tag(cid)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    fieldRow(label: "Form") {
+                        Picker("", selection: Binding(
+                            get: { editFormId ?? ticket.formId ?? 0 },
+                            set: { editFormId = $0; trackEdits(ticket: ticket) }
+                        )) {
+                            Text("None").tag(0)
+                            ForEach(formIdOptions, id: \.id) { option in
+                                Text(option.name).tag(option.id)
+                            }
+                            if let fid = ticket.formId, let fname = ticket.formName,
+                               !formIdOptions.contains(where: { $0.id == fid }) {
+                                Text(fname).tag(fid)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+
+                    // Service picker
+                    if !serviceIdOptions.isEmpty {
+                        fieldRow(label: "Service") {
+                            Picker("", selection: Binding(
+                                get: { editServiceId ?? ticket.serviceId ?? 0 },
+                                set: { editServiceId = $0; trackEdits(ticket: ticket) }
+                            )) {
+                                Text("None").tag(0)
+                                ForEach(serviceIdOptions, id: \.id) { option in
+                                    Text(option.name).tag(option.id)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                    } else if let service = ticket.serviceName, !service.isEmpty {
+                        DetailRow(label: "Service", value: service)
+                    }
+
+                    // Type picker
+                    fieldRow(label: "Type") {
+                        Picker("", selection: Binding(
+                            get: { editTypeId ?? ticket.typeId ?? 0 },
+                            set: { editTypeId = $0; trackEdits(ticket: ticket) }
+                        )) {
+                            Text("None").tag(0)
+                            ForEach(typeIdOptions, id: \.id) { option in
+                                Text(option.name).tag(option.id)
+                            }
+                            if let tid = ticket.typeId, let tname = ticket.typeName,
+                               !typeIdOptions.contains(where: { $0.id == tid }) {
+                                Text(tname).tag(tid)
+                            }
+                        }
+                        .labelsHidden()
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                // RIGHT COLUMN — people and timestamps
+                VStack(alignment: .leading, spacing: 10) {
+                    // Requestor — with inline search on demand
+                    fieldRow(label: "Requestor") {
+                        HStack(spacing: 4) {
+                            Button(action: {
+                                isChangingRequestor.toggle()
+                                if isChangingRequestor {
+                                    requestorSearchText = ""
+                                    requestorSearchResults = []
+                                }
+                            }) {
+                                Image(systemName: isChangingRequestor ? "xmark" : "pencil")
+                                    .appFont(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            Text(editRequestorName.isEmpty ? "-" : editRequestorName)
+                                .appFont(.body)
+                                .lineLimit(1)
+                            Spacer()
+                        }
+                    }
+                    if isChangingRequestor {
+                        personSearchField(
+                            searchText: $requestorSearchText,
+                            searchResults: $requestorSearchResults,
+                            isSearching: $isSearchingRequestor,
+                            showResults: $showRequestorResults,
+                            onSelect: { person in
+                                editRequestorUid = person.uid
+                                editRequestorName = person.fullName ?? ""
+                                requestorSearchText = ""
+                                showRequestorResults = false
+                                isChangingRequestor = false
+                                trackEdits(ticket: ticket)
+                            }
+                        )
+                        .padding(.leading, 104)
+                    }
+
+                    DetailRow(label: "Email", value: ticket.requestorEmail ?? "-")
+
+                    if !groupIdOptions.isEmpty {
+                        fieldRow(label: "Group") {
+                            Picker("", selection: Binding(
+                                get: { editResponsibleGroupId ?? ticket.responsibleGroupId ?? 0 },
+                                set: { editResponsibleGroupId = $0; trackEdits(ticket: ticket) }
+                            )) {
+                                Text("None").tag(0)
+                                ForEach(groupIdOptions, id: \.id) { option in
+                                    Text(option.name).tag(option.id)
+                                }
+                                if let gid = ticket.responsibleGroupId, let gname = ticket.responsibleGroupName,
+                                   !groupIdOptions.contains(where: { $0.id == gid }) {
+                                    Text(gname).tag(gid)
+                                }
+                                if let extra = reassignedGroup, extra.id != ticket.responsibleGroupId,
+                                   !groupIdOptions.contains(where: { $0.id == extra.id }) {
+                                    Text(extra.name).tag(extra.id)
+                                }
+                            }
+                            .labelsHidden()
+                        }
+                    } else {
+                        DetailRow(label: "Group", value: (reassignedGroup?.id == editResponsibleGroupId ? reassignedGroup?.name : nil)
+                                  ?? ticket.responsibleGroupName ?? "-")
+                    }
+
+                    // Responsible — Assign to me / Reassign / Unassign live on
+                    // the ticket number row; Reassign opens its popover there.
+                    DetailRow(label: "Responsible", value: editResponsibleName.isEmpty ? "-" : editResponsibleName)
+
+                    DetailRow(label: "Created", value: formatDateString(ticket.createdDate))
+                    DetailRow(label: "Modified", value: formatDateString(ticket.modifiedDate))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// A labeled field row — compact label + content
+    @ViewBuilder
+    private func fieldRow<Content: View>(label: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            Text(label)
+                .appFont(.body)
+                .foregroundColor(.secondary)
+                .frame(width: 100, alignment: .leading)
+            content()
+            Spacer()
+        }
+    }
+
+    /// Searchable person field with autocomplete dropdown
+    @ViewBuilder
+    private func personSearchField(
+        searchText: Binding<String>,
+        searchResults: Binding<[TdxPerson]>,
+        isSearching: Binding<Bool>,
+        showResults: Binding<Bool>,
+        onSelect: @escaping (TdxPerson) -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            // Search field
+            HStack(spacing: 4) {
+                Image(systemName: "magnifyingglass")
+                    .appFont(.caption)
+                    .foregroundColor(.secondary)
+                TextField("Search...", text: searchText)
+                    .textFieldStyle(.plain)
+                    .appFont(.caption)
+                    .onChange(of: searchText.wrappedValue) { _, newValue in
+                        if newValue.count >= 2 {
+                            searchPeopleDebounced(text: newValue, results: searchResults, isSearching: isSearching, showResults: showResults)
+                        } else {
+                            showResults.wrappedValue = false
+                        }
+                    }
+                if isSearching.wrappedValue {
+                    ProgressView().controlSize(.mini)
+                }
+            }
+            .padding(4)
+            .background(Color.secondary.opacity(0.08))
+            .cornerRadius(4)
+
+            if showResults.wrappedValue && !searchResults.wrappedValue.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(searchResults.wrappedValue, id: \.uid) { person in
+                        Button(action: { onSelect(person) }) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(person.fullName ?? "")
+                                    .appFont(.caption)
+                                    .foregroundColor(.primary)
+                                if let email = person.primaryEmail, !email.isEmpty {
+                                    Text(email)
+                                        .appFont(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                        .background(Color.clear)
+                        .contentShape(Rectangle())
+                        .onHover { hovering in
+                            // hover effect handled by SwiftUI
+                        }
+                    }
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+                .cornerRadius(4)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
+                .shadow(radius: 2)
+            }
+        }
+    }
+
+    /// Debounced people search
+    private func searchPeopleDebounced(
+        text: String,
+        results: Binding<[TdxPerson]>,
+        isSearching: Binding<Bool>,
+        showResults: Binding<Bool>
+    ) {
+        let searchText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard searchText.count >= 2 else { return }
+        Task {
+            isSearching.wrappedValue = true
+            defer { isSearching.wrappedValue = false }
+            do {
+                let people = try await appState.tdxService.searchPeople(searchText: searchText)
+                results.wrappedValue = people
+                showResults.wrappedValue = !people.isEmpty
+            } catch {
+                results.wrappedValue = []
+                showResults.wrappedValue = false
+            }
+        }
+    }
+
+    /// Description section — full width, read-only by default, editable on demand, auto-saves on Done
+    @ViewBuilder
+    private func descriptionSection(ticket: TdxTicket) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Description")
+                    .appFont(.body)
+                    .fontWeight(.medium)
+                    .foregroundColor(.secondary)
+                Spacer()
+                if isSavingDescription {
+                    ProgressView().controlSize(.small)
+                }
+                Button(action: {
+                    if isEditingDescription {
+                        saveDescriptionOnly(ticket: ticket)
+                    } else {
+                        isEditingDescription = true
+                        descriptionFocused = true
+                    }
+                }) {
+                    Image(systemName: isEditingDescription ? "checkmark.circle" : "pencil")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.mini)
+                .disabled(isSavingDescription)
+                .help(isEditingDescription ? "Save description" : "Edit description")
+
+                if !isEditingDescription {
+                    Button(action: {
+                        let text = editDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text.isEmpty ? "" : text, forType: .string)
+                    }) {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.mini)
+                    .help("Copy description")
+                }
+            }
+            if isEditingDescription {
+                TextEditor(text: $editDescription)
+                    .appFont(.body)
+                    .frame(minHeight: 80, maxHeight: 300)
+                    .focused($descriptionFocused)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color.accentColor.opacity(0.5), lineWidth: 1)
+                    )
+            } else {
+                let text = editDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+                if text.isEmpty {
+                    Text("No description")
+                        .appFont(.body)
+                        .foregroundColor(.secondary)
+                        .italic()
+                        .padding(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.secondary.opacity(0.06))
+                        .cornerRadius(6)
+                } else {
+                    Text(text)
+                        .appFont(.body)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                        .background(Color.secondary.opacity(0.06))
+                        .cornerRadius(6)
+                }
+            }
+        }
+    }
+
+    // MARK: - Add Comment Section
+
+    private func addCommentSection(ticket: TdxTicket) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Group {
+                CommentTextEditor(
+                    text: $newComment,
+                    focusRequested: $commentFocused,
+                    fontSize: (AppTextStyle.body.basePointSize * CGFloat(AppFontScale.clamp(appFontScale))).rounded(),
+                    accessibilityLabel: "Comment",
+                    onAttach: addCommentAttachments,
+                    onDropTargeted: { isCommentDropTargeted = $0 }
+                )
+                .frame(height: 80)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(isCommentDropTargeted ? Color.accentColor : Color.gray.opacity(0.3),
+                                lineWidth: isCommentDropTargeted ? 2 : 1)
+                )
+
+                if !commentAttachments.isEmpty {
+                    FlowLayout(spacing: 6) {
+                        ForEach(commentAttachments) { attachment in
+                            CommentAttachmentChip(attachment: attachment, isDisabled: isAddingComment) {
+                                commentAttachments.removeAll { $0.id == attachment.id }
+                            }
+                        }
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("\(commentAttachments.count) attachment\(commentAttachments.count == 1 ? "" : "s")")
+                }
+
+                HStack(spacing: 10) {
+                    // Blue only once there is something to post: a disabled
+                    // prominent button draws as a muddy grey slab.
+                    let postButton = Button(commentAttachments.isEmpty ? "Post Comment" : "Post with Attachments") {
+                        Task {
+                            isAddingComment = true
+                            await addComment(ticket: ticket)
+                            isAddingComment = false
+                            if !hasCommentDraft { isCommentSectionExpanded = false }
+                        }
+                    }
+                    // An open reply composer owns ⌘Return while it is showing.
+                    .keyboardShortcut(replyingToEntryId == nil ? KeyboardShortcut(.return, modifiers: .command) : nil)
+                    .disabled(!hasCommentDraft || isAddingComment)
+                    .help(commentAttachments.isEmpty ? "Post comment (⌘Return)"
+                          : "Upload the files to the ticket, then post the comment (⌘Return)")
+                    if hasCommentDraft {
+                        postButton.buttonStyle(.borderedProminent)
+                    } else {
+                        postButton.buttonStyle(.bordered)
+                    }
+                    Button("Cancel") {
+                        withAnimation(.easeInOut(duration: 0.15)) { isCommentSectionExpanded = false }
+                    }
+                    .help("Close the comment editor; the draft is kept")
+                    Button {
+                        isPickingCommentFiles = true
+                    } label: {
+                        Label("Attach…", systemImage: "paperclip")
+                    }
+                    .disabled(isAddingComment)
+                    .help("Attach files to this comment — or drag them onto the comment, or paste an image")
+                    Toggle("Private", isOn: $isCommentPrivate)
+                        .toggleStyle(.checkbox)
+                        .appFont(.body)
+                    if isAddingComment, let progress = commentUploadProgress {
+                        ProgressView().controlSize(.small)
+                        Text("Uploading \(min(progress.done + 1, progress.total)) of \(progress.total)…")
+                            .appFont(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .fileImporter(isPresented: $isPickingCommentFiles,
+                              allowedContentTypes: [.item],
+                              allowsMultipleSelection: true) { result in
+                    if case .success(let urls) = result {
+                        addCommentAttachments(urls.map(PendingCommentAttachment.init(fileURL:)))
+                    }
+                }
+
+                Text(isCommentPrivate ? "Only users with access to private ticket activity can see this comment." : "This comment is visible to people who can view the ticket.")
+                    .appFont(.caption)
+                    .foregroundStyle(.secondary)
+
+                // Notify options — everyone the web UI offers: the
+                // responsible group, requestor, responsible, contacts, and
+                // people held in custom attributes.
+                let recipients = notifyRecipients(ticket: ticket)
+                if !recipients.isEmpty {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Notify:")
+                            .appFont(.body)
+                            .foregroundColor(.secondary)
+                        ForEach(recipients) { recipient in
+                            Toggle(isOn: Binding(
+                                get: { notifySelection.contains(recipient.id) },
+                                set: { isOn in
+                                    if isOn { notifySelection.insert(recipient.id) } else { notifySelection.remove(recipient.id) }
+                                }
+                            )) {
+                                Text("\(recipient.name) (\(recipient.roles.joined(separator: ", ")))")
+                            }
+                            .toggleStyle(.checkbox)
+                            .appFont(.body)
+                            .help(recipient.emails.joined(separator: ", "))
+                        }
+                    }
+                }
+            }
+        }
+        // The editor takes drops itself; this catches files dropped on the
+        // buttons, chips and notify list around it.
+        .onDrop(of: [.fileURL], isTargeted: $isCommentDropTargeted) { providers in
+            loadDroppedFiles(providers)
+            return true
+        }
+    }
+
+    private func addCommentAttachments(_ added: [PendingCommentAttachment]) {
+        // The same file dropped twice is attached once.
+        let existing = Set(commentAttachments.compactMap { attachment -> URL? in
+            if case .file(let url) = attachment.source { return url.standardizedFileURL }
+            return nil
+        })
+        var pastedIndex = 0
+        for attachment in added {
+            switch attachment.source {
+            case .file(let url):
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory),
+                      !isDirectory.boolValue, !existing.contains(url.standardizedFileURL) else { continue }
+                commentAttachments.append(attachment)
+            case .data(let data):
+                // Several images pasted within one second still get distinct names.
+                let taken = Set(commentAttachments.map(\.fileName))
+                var name = attachment.fileName
+                while taken.contains(name) {
+                    pastedIndex += 1
+                    name = PendingCommentAttachment.pastedImageName(index: pastedIndex)
+                }
+                commentAttachments.append(PendingCommentAttachment(imageData: data, fileName: name))
+            }
+        }
+    }
+
+    private func loadDroppedFiles(_ providers: [NSItemProvider]) {
+        for provider in providers {
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, url.isFileURL else { return }
+                DispatchQueue.main.async {
+                    addCommentAttachments([PendingCommentAttachment(fileURL: url)])
+                }
+            }
+        }
+    }
+
+    // MARK: - People Section
+
+    /// The ticket's contacts, with add and remove, and its responsible group.
+    /// Contacts added here show up straight away as notify recipients.
+    private func peopleSection(ticket: TdxTicket) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button(action: { withAnimation(.easeInOut(duration: 0.15)) { isPeopleExpanded.toggle() } }) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .appFont(.caption)
+                        .foregroundColor(.secondary)
+                        .rotationEffect(.degrees(isPeopleExpanded ? 90 : 0))
+                    Text("People")
+                        .appFont(.headline)
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(isPeopleExpanded ? "Hide people" : "Show the ticket's contacts and group")
+
+            if isPeopleExpanded {
+                if let peopleErrorMessage {
+                    Label(peopleErrorMessage, systemImage: "exclamationmark.triangle.fill")
+                        .appFont(.caption)
+                        .foregroundColor(.orange)
+                }
+
+                Text("Contacts")
+                    .appFont(.subheadline)
+                    .foregroundColor(.secondary)
+                HStack(alignment: .top, spacing: 6) {
+                    personSearchField(
+                        searchText: $contactSearchText,
+                        searchResults: $contactSearchResults,
+                        isSearching: $isSearchingContact,
+                        showResults: $showContactResults,
+                        onSelect: { person in
+                            contactSearchText = ""
+                            showContactResults = false
+                            Task { await addContact(person, ticket: ticket) }
+                        }
+                    )
+                    .frame(maxWidth: 360)
+                    if isAddingContact { ProgressView().controlSize(.small) }
+                }
+                if ticketContacts.isEmpty {
+                    Text("No contacts")
+                        .appFont(.caption)
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(ticketContacts, id: \.id) { person in
+                        HStack(spacing: 8) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(person.fullName ?? "Unknown")
+                                    .appFont(.body)
+                                Text([person.primaryEmail, person.defaultAccountName]
+                                        .compactMap { $0?.isEmpty == false ? $0 : nil }
+                                        .joined(separator: " · "))
+                                    .appFont(.caption)
+                                    .foregroundColor(.secondary)
+                                    .textSelection(.enabled)
+                            }
+                            Spacer()
+                            Button(action: { Task { await removeContact(person, ticket: ticket) } }) {
+                                Image(systemName: "trash")
+                                    .appFont(.caption)
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Remove \(person.fullName ?? "this person") from the ticket's contacts")
+                        }
+                    }
+                }
+
+                if let group = ticket.responsibleGroupName, !group.isEmpty {
+                    Text("Resources")
+                        .appFont(.subheadline)
+                        .foregroundColor(.secondary)
+                        .padding(.top, 4)
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.3")
+                            .appFont(.caption)
+                            .foregroundColor(.secondary)
+                        Text(group)
+                            .appFont(.body)
+                        Text("Group")
+                            .appFont(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .help(groupMembers.compactMap(\.fullName).joined(separator: ", "))
+                }
+            }
+        }
+    }
+
+    /// Load contacts, responsible group members and attribute people for the
+    /// open ticket. Each source fails on its own — a group the session can't
+    /// read still leaves the contacts usable.
+    private func loadTicketPeople(ticket: TdxTicket) async {
+        guard let ticketId = ticket.id else { return }
+        let service = appState.tdxService
+
+        async let contacts = try? service.getTicketContacts(ticketId: ticketId)
+        let groupId = ticket.responsibleGroupId ?? 0
+        var members = groupMemberCache[groupId]
+        if members == nil, groupId > 0 {
+            members = try? await service.getGroupMembers(groupId: groupId)
+            if let members { groupMemberCache[groupId] = members }
+        }
+        var fromAttributes: [AttributePerson] = []
+        for attribute in ticket.personAttributes {
+            guard let uid = attribute.value?.trimmingCharacters(in: .whitespaces),
+                  let person = try? await service.getPerson(uid: uid) else { continue }
+            fromAttributes.append(AttributePerson(label: attribute.name ?? "Contact", person: person))
+        }
+        let loadedContacts = await contacts
+
+        guard selectedTicketIds.first == ticketId else { return }
+        ticketContacts = loadedContacts ?? []
+        groupMembers = members ?? []
+        attributePeople = fromAttributes
+    }
+
+    private func addContact(_ person: TdxPerson, ticket: TdxTicket) async {
+        guard let ticketId = ticket.id, let uid = person.uid else { return }
+        guard !ticketContacts.contains(where: { $0.uid == uid }) else { return }
+        isAddingContact = true
+        defer { isAddingContact = false }
+        do {
+            try await appState.tdxService.addTicketContact(ticketId: ticketId, uid: uid)
+            peopleErrorMessage = nil
+            ticketContacts = (try? await appState.tdxService.getTicketContacts(ticketId: ticketId))
+                ?? ticketContacts + [person]
+        } catch {
+            peopleErrorMessage = "Couldn't add \(person.fullName ?? "contact"): \(error.localizedDescription)"
+        }
+    }
+
+    private func removeContact(_ person: TdxPerson, ticket: TdxTicket) async {
+        guard let ticketId = ticket.id, let uid = person.uid else { return }
+        do {
+            try await appState.tdxService.removeTicketContact(ticketId: ticketId, uid: uid)
+            peopleErrorMessage = nil
+            ticketContacts.removeAll { $0.uid == uid }
+            if let email = Self.notificationEmail(person.primaryEmail) {
+                notifySelection.remove(email.lowercased())
+            }
+        } catch {
+            peopleErrorMessage = "Couldn't remove \(person.fullName ?? "contact"): \(error.localizedDescription)"
+        }
+    }
+
+    /// Everyone a comment can notify, merged by email so a person who is both
+    /// requestor and contact appears once with both roles.
+    private func notifyRecipients(ticket: TdxTicket) -> [NotifyRecipient] {
+        var recipients: [NotifyRecipient] = []
+
+        if let groupId = ticket.responsibleGroupId, groupId > 0,
+           let group = ticket.responsibleGroupName, !group.isEmpty {
+            let emails = groupMembers
+                .filter { $0.isGroupNotified != false }
+                .compactMap { Self.notificationEmail($0.primaryEmail) }
+            if !emails.isEmpty {
+                recipients.append(NotifyRecipient(id: "group:\(groupId)", name: group,
+                                                  roles: ["Responsible Group"], emails: emails))
+            }
+        }
+
+        func add(name: String?, email: String?, role: String) {
+            guard let email = Self.notificationEmail(email) else { return }
+            let key = email.lowercased()
+            if let index = recipients.firstIndex(where: { $0.id == key }) {
+                if !recipients[index].roles.contains(role) { recipients[index].roles.append(role) }
+                return
+            }
+            let display = (name?.isEmpty == false ? name : nil) ?? email
+            recipients.append(NotifyRecipient(id: key, name: display, roles: [role], emails: [email]))
+        }
+
+        add(name: ticket.requestorName, email: ticket.requestorEmail, role: "Requestor")
+        add(name: ticket.responsibleFullName, email: ticket.responsibleEmail, role: "Responsible")
+        for person in ticketContacts {
+            add(name: person.fullName, email: person.primaryEmail, role: "Contact")
+        }
+        for entry in attributePeople {
+            add(name: entry.person.fullName, email: entry.person.primaryEmail, role: entry.label)
+        }
+        return recipients
+    }
+
+    // MARK: - Activity Section
+
+    /// Pinned above the feed: the title and the filter that decides what the
+    /// feed below is showing. Scrolling either of those away leaves you reading
+    /// a list with no label on it.
+    private var activityHeader: some View {
+        HStack(spacing: 10) {
+            Text("Activity")
+                .appFont(.headline)
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { isCommentSectionExpanded.toggle() }
+                if isCommentSectionExpanded { commentFocused = true }
+            } label: {
+                Label(hasCommentDraft && !isCommentSectionExpanded ? "Add Comment (Draft)" : "Add Comment",
+                      systemImage: "square.and.pencil")
+            }
+            .help(isCommentSectionExpanded ? "Close the comment editor" : "Write a comment")
+            Spacer()
+            Picker("", selection: $feedFilter) {
+                Text("Comments").tag(FeedFilterType.comments)
+                Text("Edits").tag(FeedFilterType.edits)
+                Text("Status").tag(FeedFilterType.statusChanges)
+                Text("All").tag(FeedFilterType.all)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 320)
+        }
+    }
+
+    private var hasCommentDraft: Bool {
+        !newComment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !commentAttachments.isEmpty
+    }
+
+    private var activityFeed: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if isLoadingFeed {
+                ProgressView("Loading activity...")
+                    .padding()
+            } else if let feedLoadError {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(feedLoadError).foregroundStyle(.secondary)
+                    Button("Retry Activity") {
+                        if let id = selectedTicket?.id { loadTicketFeed(ticketId: id) }
+                    }
+                }
+            } else if filteredFeed.isEmpty {
+                Text("No comments yet")
+                    .foregroundColor(.secondary)
+                    .padding(.vertical, 8)
+            } else {
+                // Threads need more air between them than rows within a thread
+                // have, or one thread's replies read as belonging to the next
+                // comment down. Each row already carries its own trailing gap.
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(filteredFeed, id: \.id) { entry in
+                        feedEntryRow(entry)
+                    }
+                }
+                .confirmationDialog(
+                    "Delete this reply?",
+                    isPresented: Binding(get: { pendingReplyDeletion != nil },
+                                         set: { if !$0 { pendingReplyDeletion = nil } }),
+                    presenting: pendingReplyDeletion
+                ) { pending in
+                    Button("Delete Reply", role: .destructive) {
+                        Task { await deleteReply(pending) }
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: { _ in
+                    Text("TeamDynamix replaces the reply with a deletion notice. It can't be restored.")
+                }
+            }
+        }
+    }
+
+    private func feedEntryRow(_ entry: TdxFeedEntry) -> some View {
+        let isComposing = entry.id != nil && entry.id == replyingToEntryId
+        return FeedEntryRow(
+            entry: entry,
+            onReply: entry.id == nil ? nil : openReplyComposer,
+            onQuote: quoteInComment,
+            onDeleteReply: { reply in
+                guard let parentId = entry.id else { return }
+                pendingReplyDeletion = PendingReplyDeletion(parentId: parentId, reply: reply)
+            },
+            canDeleteReply: isOwnReply,
+            replyComposer: isComposing ? AnyView(replyComposer(for: entry)) : nil,
+            composerAuthor: appState.tdxMe?.fullName
+        )
+    }
+
+    private func replyComposer(for entry: TdxFeedEntry) -> some View {
+        let entryId = entry.id ?? 0
+        return FeedReplyComposer(
+            parentAuthor: entry.createdFullName,
+            parentIsPrivate: entry.isPrivate == true,
+            draft: Binding(
+                get: { replyDrafts[entryId] ?? FeedReplyDraft() },
+                set: { replyDrafts[entryId] = $0.isEmpty ? nil : $0 }
+            ),
+            focusRequested: $replyFocused,
+            isPosting: postingReplyEntryId == entryId,
+            uploadProgress: postingReplyEntryId == entryId ? replyUploadProgress : nil,
+            onPost: {
+                guard let ticketId = selectedTicket?.id else { return }
+                Task { await postReply(to: entry, ticketId: ticketId) }
+            },
+            onCancel: {
+                withAnimation(.easeInOut(duration: 0.15)) { replyingToEntryId = nil }
+            }
+        )
+    }
+
+    private func openReplyComposer(_ entry: TdxFeedEntry) {
+        guard let id = entry.id else { return }
+        withAnimation(.easeInOut(duration: 0.15)) { replyingToEntryId = id }
+        replyFocused = true
+    }
+
+    /// Only the signed-in person's own replies offer Delete. TDX would also let
+    /// someone holding "Delete Any Feed Entry" remove anybody's, but that is a
+    /// moderation job for the web UI, not a context-menu slip.
+    private func isOwnReply(_ reply: TdxFeedEntry) -> Bool {
+        guard let mine = appState.tdxMe?.uid?.lowercased(), !mine.isEmpty,
+              let author = reply.createdUid?.lowercased() else { return false }
+        return mine == author
+    }
+
+    // MARK: - Date Range Helpers
+
+    private var activeDateRange: (from: Date, to: Date) {
+        if datePreset == .custom {
+            return (customDateFrom, customDateTo)
+        }
+        return datePreset.dateRange()
+    }
+
+    private var dateRangeLabel: String {
+        let fmt = DateFormatter()
+        fmt.dateStyle = .medium
+        fmt.timeStyle = .none
+        let range = activeDateRange
+        return "\(fmt.string(from: range.from)) – \(fmt.string(from: range.to))"
+    }
+
+    private var isTermPreset: Bool {
+        if case .term = datePreset { return true }
+        return false
+    }
+
+    private var isLastTermPreset: Bool {
+        if case .term(let t, let y) = datePreset {
+            let cal = Calendar.current
+            let now = Date()
+            let month = cal.component(.month, from: now)
+            let year = cal.component(.year, from: now)
+            let lastTerm: AcademicTerm
+            let lastYear: Int
+            if month >= 1 && month <= 4 {
+                lastTerm = .fall; lastYear = year - 1
+            } else if month >= 5 && month <= 8 {
+                lastTerm = .spring; lastYear = year
+            } else {
+                lastTerm = .summer; lastYear = year
+            }
+            return t == lastTerm && y == lastYear
+        }
+        return false
+    }
+
+    private var isDefaultDatePreset: Bool {
+        if case .term(let t, let y) = datePreset {
+            let cal = Calendar.current
+            let now = Date()
+            let month = cal.component(.month, from: now)
+            let year = cal.component(.year, from: now)
+            let currentTerm: AcademicTerm
+            if month >= 1 && month <= 4 { currentTerm = .spring }
+            else if month >= 5 && month <= 8 { currentTerm = .summer }
+            else { currentTerm = .fall }
+            return t == currentTerm && y == year
+        }
+        return false
+    }
+
+    private func resetToCurrentTerm() {
+        let cal = Calendar.current
+        let now = Date()
+        let month = cal.component(.month, from: now)
+        let year = cal.component(.year, from: now)
+        if month >= 1 && month <= 4 { termSeason = .spring }
+        else if month >= 5 && month <= 8 { termSeason = .summer }
+        else { termSeason = .fall }
+        termYear = year
+        datePreset = .term(termSeason, termYear)
+        loadTickets()
+    }
+
+    private func setLastTerm() {
+        let cal = Calendar.current
+        let now = Date()
+        let month = cal.component(.month, from: now)
+        let year = cal.component(.year, from: now)
+        if month >= 1 && month <= 4 {
+            // Current is Spring → last term is Fall of previous year
+            termSeason = .fall
+            termYear = year - 1
+        } else if month >= 5 && month <= 8 {
+            // Current is Summer → last term is Spring same year
+            termSeason = .spring
+            termYear = year
+        } else {
+            // Current is Fall → last term is Summer same year
+            termSeason = .summer
+            termYear = year
+        }
+        datePreset = .term(termSeason, termYear)
+        loadTickets()
+    }
+
+    /// Apply a dashboard widget's deep-linked filter (a status wedge or
+    /// priority bar).
+    private func consumeModuleFilter() {
+        guard let link = appState.navigateToModuleFilter, link.tab == .tickets,
+              let category = TicketFilterCategory(rawValue: link.category) else { return }
+        appState.navigateToModuleFilter = nil
+        filters.selectedValues[category] = [resolveFilterValue(link.value, in: filters.availableValues[category])]
+    }
+
+    // MARK: - Data Loading
+
+    /// Resolve the search text to people, then pull their tickets from TDX.
+    ///
+    /// Two round trips rather than one: the ticket search takes requestor UIDs,
+    /// not a name, so the name has to become a person first.
+    private func resolveRequestorHits() async {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard query.count >= 2, appState.config.isTdxConfigured else {
+            requestorHits = []
+            return
+        }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        guard !Task.isCancelled else { return }
+
+        guard let people = try? await appState.tdxService.searchPeople(searchText: query, maxResults: 10) else { return }
+        let uids = people.compactMap(\.uid)
+        guard !uids.isEmpty else {
+            if !Task.isCancelled { requestorHits = [] }
+            return
+        }
+
+        let request = TicketSearchRequest(requestorUids: uids, maxResults: 200)
+        guard let found = try? await appState.tdxService.searchTickets(search: request, maxResults: 200) else { return }
+        guard !Task.isCancelled else { return }
+        requestorHits = found
+    }
+
+    private func loadTickets() {
+        guard appState.config.isTdxConfigured else { return }
+        Task {
+            isLoading = true
+            defer { isLoading = false }
+            do {
+                let range = activeDateRange
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime]
+                let groupIds = appState.config.tdxResponsibleGroupId.map { [$0] }
+                let service = appState.tdxService
+
+                // Tickets created in the selected range.
+                let ranged = TicketSearchRequest(
+                    responsibleGroupIds: groupIds,
+                    createdDateFrom: formatter.string(from: range.from),
+                    createdDateTo: formatter.string(from: range.to),
+                    maxResults: 5000
+                )
+                // Every open ticket, whenever it was created: a work board
+                // that only shows this term's tickets hides the backlog, and
+                // people look as if they have no work.
+                let open = TicketSearchRequest(
+                    statusClassIds: TicketSearchRequest.openStatusClassIds,
+                    responsibleGroupIds: groupIds,
+                    maxResults: 5000
+                )
+                async let rangedTickets = service.searchTickets(search: ranged, maxResults: 5000)
+                async let openTickets = service.searchTickets(search: open, maxResults: 5000)
+
+                // A configured group filter drops tickets assigned straight to
+                // a person with no group. Fetch the signed-in user's open
+                // tickets separately so their own work never vanishes.
+                var mine: [TdxTicket] = []
+                if groupIds != nil, let myUid = appState.tdxMe?.uid {
+                    let request = TicketSearchRequest(
+                        statusClassIds: TicketSearchRequest.openStatusClassIds,
+                        responsibleUids: [myUid],
+                        maxResults: 1000
+                    )
+                    mine = (try? await service.searchTickets(search: request, maxResults: 1000)) ?? []
+                }
+
+                var seen: Set<Int> = []
+                let fetchedTickets = (try await rangedTickets + (try await openTickets) + mine)
+                    .filter { $0.id.map { seen.insert($0).inserted } ?? true }
+                appState.updateTicketsCache(fetchedTickets)
+                ticketsLoadError = nil
+            } catch {
+                dbg.warn("Tickets load failed: \(error)", category: "tickets")
+                ticketsLoadError = error.localizedDescription
+            }
+        }
+    }
+
+    private func refreshTickets() {
+        loadTickets()
+        guard let id = selectedTicket?.id else { return }
+        loadTicketDetail(ticketId: id)
+        loadTicketFeed(ticketId: id)
+    }
+
+    private func loadTicketDetail(ticketId: Int) {
+        ticketActivityRevision += 1
+        let request = detailLoadGate.begin(ticketId: ticketId)
+        isLoadingDetail = true
+        Task {
+            defer {
+                if detailLoadGate.accepts(request, selectedTicketId: selectedId) {
+                    isLoadingDetail = false
+                }
+            }
+            do {
+                let full = try await appState.tdxService.getTicket(id: ticketId)
+                guard detailLoadGate.accepts(request, selectedTicketId: selectedId) else { return }
+                if let full {
+                    detailedTicket = full
+                    populateEditFields(from: full)
+                    await loadTicketPeople(ticket: full)
+                }
+            } catch {
+                guard detailLoadGate.accepts(request, selectedTicketId: selectedId) else { return }
+                saveErrorMessage = "Could not load ticket details: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func loadTicketFeed(ticketId: Int) {
+        let request = feedLoadGate.begin(ticketId: ticketId)
+        isLoadingFeed = true
+        feedLoadError = nil
+        ticketFeed = []
+        Task {
+            defer {
+                if feedLoadGate.accepts(request, selectedTicketId: selectedId) {
+                    isLoadingFeed = false
+                }
+            }
+            do {
+                let loadedFeed = try await appState.tdxService.getTicketFeed(ticketId: ticketId)
+                guard feedLoadGate.accepts(request, selectedTicketId: selectedId) else { return }
+                ticketFeed = loadedFeed
+            } catch {
+                guard feedLoadGate.accepts(request, selectedTicketId: selectedId) else { return }
+                ticketFeed = []
+                feedLoadError = "Could not load activity: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func loadForms() async {
+        do {
+            allForms = try await appState.tdxService.getForms()
+        } catch {
+            print("Failed to load forms: \(error)")
+        }
+    }
+
+    private func populateEditFields(from ticket: TdxTicket) {
+        editTitle = ticket.title ?? ""
+        editStatusId = ticket.statusId
+        editPriorityId = ticket.priorityId
+        editDescription = Self.decodeHtml(ticket.description ?? "")
+        editResponsibleGroupId = ticket.responsibleGroupId
+        editServiceId = ticket.serviceId
+        editFormId = ticket.formId
+        editClassification = ticket.classification
+        editTypeId = ticket.typeId
+        editRequestorUid = ticket.requestorUid
+        editRequestorName = ticket.requestorName ?? ""
+        editResponsibleUid = ticket.responsibleUid
+        editResponsibleName = ticket.responsibleFullName ?? ""
+        // Reset search state
+        requestorSearchText = ""
+        requestorSearchResults = []
+        showRequestorResults = false
+        reassignedGroup = nil
+        if let pending = pendingReassignTicketId, pending == ticket.id {
+            pendingReassignTicketId = nil
+            isReassigning = true
+        } else {
+            isReassigning = false
+        }
+        notifyNewResponsible = true
+        isChangingRequestor = false
+        hasEdits = false
+        isEditingDescription = false
+    }
+
+    private func trackEdits(ticket: TdxTicket) {
+        let origTitle = ticket.title ?? ""
+        hasEdits = editTitle.trimmingCharacters(in: .whitespacesAndNewlines) != origTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            || editStatusId != ticket.statusId
+            || editPriorityId != ticket.priorityId
+            || editResponsibleGroupId != ticket.responsibleGroupId
+            || editServiceId != ticket.serviceId
+            || editFormId != ticket.formId
+            || editClassification != ticket.classification
+            || editTypeId != ticket.typeId
+            || editRequestorUid != ticket.requestorUid
+            || editResponsibleUid != ticket.responsibleUid
+    }
+
+    private func discardEdits(ticket: TdxTicket) {
+        populateEditFields(from: ticket)
+    }
+
+    /// Save only the description field immediately (called when user clicks Done)
+    private func saveDescriptionOnly(ticket: TdxTicket) {
+        guard let ticketId = ticket.id else { return }
+        let trimmedDesc = editDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let origDesc = Self.decodeHtml(ticket.description ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard trimmedDesc != origDesc else {
+            isEditingDescription = false
+            return
+        }
+
+        Task {
+            isSavingDescription = true
+            defer { isSavingDescription = false }
+            do {
+                let htmlDesc = trimmedDesc.isEmpty ? "" : trimmedDesc
+                    .split(separator: "\n", omittingEmptySubsequences: false)
+                    .map { "<p>\($0)</p>" }
+                    .joined()
+
+                let changes: [String: Any] = [
+                    "Description": htmlDesc,
+                    "IsRichHtml": true
+                ]
+
+                if let updated = try await appState.tdxService.updateTicket(id: ticketId, updates: changes) {
+                    detailedTicket = updated
+                    editDescription = Self.decodeHtml(updated.description ?? "")
+                    isEditingDescription = false
+                } else {
+                    saveErrorMessage = "Failed to save description — server returned no data."
+                }
+            } catch {
+                saveErrorMessage = "Description save failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func saveTicket(ticket: TdxTicket) {
+        guard let ticketId = ticket.id else { return }
+        Task {
+            isSaving = true
+            saveErrorMessage = nil
+            saveSucceeded = false
+            defer { isSaving = false }
+            do {
+                // Fetch fresh ticket to compare against
+                let freshTicket = try await appState.tdxService.getTicket(id: ticketId) ?? ticket
+
+                // Build a dictionary of ONLY the fields that actually changed
+                var changes: [String: Any] = [:]
+
+                let trimmedTitle = editTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+                let origTitle = (freshTicket.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedTitle.isEmpty && trimmedTitle != origTitle {
+                    changes["Title"] = trimmedTitle
+                }
+                if editStatusId != freshTicket.statusId {
+                    changes["StatusID"] = editStatusId as Any
+                }
+                if editPriorityId != freshTicket.priorityId {
+                    changes["PriorityID"] = editPriorityId as Any
+                }
+                if editClassification != freshTicket.classification {
+                    changes["Classification"] = editClassification as Any
+                }
+                if editTypeId != freshTicket.typeId {
+                    changes["TypeID"] = editTypeId as Any
+                }
+                if editRequestorUid != freshTicket.requestorUid {
+                    changes["RequestorUid"] = editRequestorUid as Any
+                }
+                if editResponsibleUid != freshTicket.responsibleUid {
+                    changes["ResponsibleUid"] = editResponsibleUid as Any
+                }
+                if editResponsibleGroupId != freshTicket.responsibleGroupId {
+                    changes["ResponsibleGroupID"] = editResponsibleGroupId as Any
+                }
+                if editServiceId != freshTicket.serviceId {
+                    changes["ServiceID"] = editServiceId as Any
+                }
+                if editFormId != freshTicket.formId {
+                    changes["FormID"] = editFormId as Any
+                }
+
+                guard !changes.isEmpty else {
+                    hasEdits = false
+                    return
+                }
+
+                let shouldNotify = notifyNewResponsible && editResponsibleUid != freshTicket.responsibleUid
+
+                if let updated = try await appState.tdxService.updateTicket(id: ticketId, updates: changes, notifyNewResponsible: shouldNotify) {
+                    detailedTicket = updated
+                    populateEditFields(from: updated)
+                    saveSucceeded = true
+                    loadTickets()
+                    loadTicketDetail(ticketId: ticketId)
+                    try? await Task.sleep(for: .seconds(2))
+                    saveSucceeded = false
+                } else {
+                    saveErrorMessage = "Save failed — server returned no data. Check your session."
+                }
+            } catch {
+                saveErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: - Set Parent Sheet
+
+    private func setParentSheet(ticket: TdxTicket) -> some View {
+        VStack(spacing: 16) {
+            Text("Set Parent Ticket")
+                .appFont(.headline)
+            TextField("Parent Ticket ID", text: $parentTicketIdText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 200)
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    showSetParentSheet = false
+                    parentTicketIdText = ""
+                }
+                Button("Set Parent") {
+                    setParentTicket(ticket: ticket)
+                }
+                .disabled(parentTicketIdText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSettingParent)
+                .keyboardShortcut(.defaultAction)
+            }
+            if isSettingParent {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .padding(24)
+    }
+
+    private func setParentTicket(ticket: TdxTicket) {
+        guard let ticketId = ticket.id else { return }
+        let parentIdStr = parentTicketIdText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let parentId = Int(parentIdStr) else {
+            saveErrorMessage = "Invalid parent ticket ID."
+            return
+        }
+        Task {
+            isSettingParent = true
+            defer { isSettingParent = false }
+            do {
+                let updateRequest = TicketUpdateRequest(from: ticket, parentId: parentId)
+                if let updated = try await appState.tdxService.updateTicket(id: ticketId, request: updateRequest) {
+                    detailedTicket = updated
+                    populateEditFields(from: updated)
+                    showSetParentSheet = false
+                    parentTicketIdText = ""
+                } else {
+                    saveErrorMessage = "Failed to set parent ticket."
+                }
+            } catch {
+                saveErrorMessage = "Set parent failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // MARK: - Create Parent Sheet
+
+    private func createParentSheet(ticket: TdxTicket) -> some View {
+        VStack(spacing: 16) {
+            Text("Create Parent Ticket")
+                .appFont(.headline)
+            Text("A new ticket with this one's type, account, requestor and owners, set as its parent.")
+                .appFont(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(width: 320)
+            TextField("Parent title", text: $newParentTitle)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 320)
+            HStack(spacing: 12) {
+                Button("Cancel") {
+                    showCreateParentSheet = false
+                    newParentTitle = ""
+                }
+                Button("Create Parent") {
+                    createParentTicket(for: ticket)
+                }
+                .disabled(newParentTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSettingParent)
+                .keyboardShortcut(.defaultAction)
+            }
+            if isSettingParent {
+                ProgressView()
+                    .controlSize(.small)
+            }
+        }
+        .padding(24)
+    }
+
+    /// TDX has no route that creates a parent: create the ticket, then make it
+    /// this one's parent the same way Set Parent does.
+    private func createParentTicket(for ticket: TdxTicket) {
+        guard let ticketId = ticket.id else { return }
+        let request = CreateTicketRequest.parent(of: ticket, title: newParentTitle)
+        Task {
+            isSettingParent = true
+            defer { isSettingParent = false }
+            do {
+                guard let parent = try await appState.tdxService.createTicket(request: request),
+                      let parentId = parent.id else {
+                    saveErrorMessage = "Failed to create the parent ticket."
+                    return
+                }
+                let updateRequest = TicketUpdateRequest(from: ticket, parentId: parentId)
+                guard let updated = try await appState.tdxService.updateTicket(id: ticketId, request: updateRequest) else {
+                    saveErrorMessage = "Created ticket \(parentId), but could not set it as the parent."
+                    return
+                }
+                detailedTicket = updated
+                populateEditFields(from: updated)
+                showCreateParentSheet = false
+                newParentTitle = ""
+            } catch {
+                saveErrorMessage = "Create parent failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Upload the draft's files to the ticket, then post its text.
+    ///
+    /// TDX keeps attachments on the ticket, not on feed entries, so the files
+    /// land in the ticket's Attachments list (private when the comment is).
+    /// Every file goes up before the comment: if any fails, the comment is
+    /// held back and the failed files stay attached to the draft, so Post can
+    /// be pressed again without posting the text twice.
+    private func addComment(ticket: TdxTicket) async {
+        guard let ticketId = ticket.id else { return }
+        let revision = selectionRevision
+        let submittedDraft = commentDraft
+        let submittedComment = newComment
+        let submittedPrivate = isCommentPrivate
+        let submittedNotify = notifySelection
+        let submittedAttachments = commentAttachments
+        var notificationEmails = notifyRecipients(ticket: ticket)
+            .filter { submittedNotify.contains($0.id) }
+            .flatMap(\.emails)
+        notificationEmails = notificationEmails.reduce(into: []) { result, email in
+            guard !result.contains(where: { $0.caseInsensitiveCompare(email) == .orderedSame }) else { return }
+            result.append(email)
+        }
+
+        if !submittedAttachments.isEmpty {
+            var failures: [String] = []
+            var uploaded: Set<UUID> = []
+            for (index, attachment) in submittedAttachments.enumerated() {
+                commentUploadProgress = (index, submittedAttachments.count)
+                do {
+                    let data = try attachment.loadData()
+                    try await appState.tdxService.uploadAttachment(
+                        ticketId: ticketId,
+                        fileName: attachment.fileName,
+                        data: data,
+                        isPrivate: submittedPrivate
+                    )
+                    uploaded.insert(attachment.id)
+                } catch let error as TdxUploadError {
+                    failures.append(error.localizedDescription)
+                } catch {
+                    failures.append("\(attachment.fileName): \(error.localizedDescription)")
+                }
+            }
+            commentUploadProgress = nil
+
+            if !uploaded.isEmpty {
+                refreshAttachmentList(ticketId: ticketId, revision: revision)
+                if var stored = commentDrafts[ticketId] {
+                    stored.attachments.removeAll { uploaded.contains($0.id) }
+                    commentDrafts[ticketId] = stored.isEmpty ? nil : stored
+                }
+            }
+            let stillOnTicket = selectionRevision == revision && selectedTicket?.id == ticketId
+            if stillOnTicket {
+                commentAttachments.removeAll { uploaded.contains($0.id) }
+            }
+
+            if !failures.isEmpty {
+                let attachedNote = uploaded.isEmpty ? "" : " \(uploaded.count) other file\(uploaded.count == 1 ? " was" : "s were") attached."
+                let held = submittedComment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "" : " The comment was not posted."
+                let message = "Couldn't attach \(failures.count == 1 ? "a file" : "\(failures.count) files"): "
+                    + failures.joined(separator: "; ") + "." + attachedNote + held
+                commentPostErrors[ticketId] = message
+                if stillOnTicket { saveErrorMessage = message }
+                return
+            }
+        }
+
+        guard !submittedComment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            // Files only: nothing to post to the feed.
+            commentPostErrors[ticketId] = nil
+            if commentDrafts[ticketId]?.isEmpty == true { commentDrafts[ticketId] = nil }
+            guard selectionRevision == revision, selectedTicket?.id == ticketId else { return }
+            if isCommentPrivate == submittedPrivate, newComment == submittedComment {
+                isCommentPrivate = false
+            }
+            loadTicketFeed(ticketId: ticketId)
+            return
+        }
+
+        do {
+            _ = try await appState.tdxService.addComment(
+                ticketId: ticketId,
+                comment: submittedComment,
+                isPrivate: submittedPrivate,
+                notifyEmails: notificationEmails.isEmpty ? nil : notificationEmails
+            )
+            commentPostErrors[ticketId] = nil
+            if commentDrafts[ticketId] == submittedDraft { commentDrafts[ticketId] = nil }
+            guard selectionRevision == revision, selectedTicket?.id == ticketId else { return }
+            // Leave anything typed while the request was running untouched.
+            if newComment == submittedComment, isCommentPrivate == submittedPrivate,
+               notifySelection == submittedNotify {
+                newComment = ""
+                isCommentPrivate = false
+                notifySelection = []
+            }
+            loadTicketFeed(ticketId: ticketId)
+        } catch {
+            let message = "Comment failed: \(error.localizedDescription)"
+            commentPostErrors[ticketId] = message
+            guard selectionRevision == revision, selectedTicket?.id == ticketId else { return }
+            saveErrorMessage = message
+        }
+    }
+
+    /// Upload a reply's files to the ticket, then post its text into the thread.
+    ///
+    /// Mirrors `addComment`: files first, private when the comment answered is,
+    /// and the text held back if any file fails so Post can be pressed again
+    /// without the reply posting twice.
+    private func postReply(to entry: TdxFeedEntry, ticketId: Int) async {
+        guard let entryId = entry.id, postingReplyEntryId == nil else { return }
+        let submitted = replyDrafts[entryId] ?? FeedReplyDraft()
+        guard !submitted.isEmpty else { return }
+        let revision = selectionRevision
+        postingReplyEntryId = entryId
+        defer {
+            postingReplyEntryId = nil
+            replyUploadProgress = nil
+        }
+
+        if !submitted.attachments.isEmpty {
+            var failures: [String] = []
+            var uploaded: Set<UUID> = []
+            for (index, attachment) in submitted.attachments.enumerated() {
+                replyUploadProgress = (index, submitted.attachments.count)
+                do {
+                    try await appState.tdxService.uploadAttachment(
+                        ticketId: ticketId,
+                        fileName: attachment.fileName,
+                        data: try attachment.loadData(),
+                        isPrivate: entry.isPrivate == true
+                    )
+                    uploaded.insert(attachment.id)
+                } catch let error as TdxUploadError {
+                    failures.append(error.localizedDescription)
+                } catch {
+                    failures.append("\(attachment.fileName): \(error.localizedDescription)")
+                }
+            }
+            replyUploadProgress = nil
+            if !uploaded.isEmpty {
+                replyDrafts[entryId]?.attachments.removeAll { uploaded.contains($0.id) }
+                if replyDrafts[entryId]?.isEmpty == true { replyDrafts[entryId] = nil }
+                refreshAttachmentList(ticketId: ticketId, revision: revision)
+            }
+            if !failures.isEmpty {
+                let held = submitted.hasText ? " The reply was not posted." : ""
+                if selectionRevision == revision {
+                    saveErrorMessage = "Couldn't attach \(failures.count == 1 ? "a file" : "\(failures.count) files"): "
+                        + failures.joined(separator: "; ") + "." + held
+                }
+                return
+            }
+        }
+
+        if submitted.hasText {
+            do {
+                try await appState.tdxService.replyToFeedEntry(entryId: entryId, body: submitted.text)
+            } catch {
+                if selectionRevision == revision { saveErrorMessage = "Reply failed: \(error.localizedDescription)" }
+                return
+            }
+            // Leave anything typed while the request was running untouched.
+            if replyDrafts[entryId]?.text == submitted.text { replyDrafts[entryId]?.text = "" }
+            if replyDrafts[entryId]?.isEmpty == true { replyDrafts[entryId] = nil }
+        }
+
+        guard selectionRevision == revision else { return }
+        if replyDrafts[entryId] == nil, replyingToEntryId == entryId {
+            withAnimation(.easeInOut(duration: 0.15)) { replyingToEntryId = nil }
+        }
+        await refreshReplies(entryId: entryId, revision: revision)
+    }
+
+    private func deleteReply(_ pending: PendingReplyDeletion) async {
+        guard let replyId = pending.reply.id else { return }
+        let revision = selectionRevision
+        do {
+            try await appState.tdxService.deleteFeedReply(entryId: pending.parentId, replyId: replyId)
+        } catch {
+            if selectionRevision == revision { saveErrorMessage = "Couldn't delete the reply: \(error.localizedDescription)" }
+            return
+        }
+        await refreshReplies(entryId: pending.parentId, revision: revision)
+    }
+
+    /// Re-read one thread rather than the whole feed, so the rest of the
+    /// activity list — and where it is scrolled to — stays put.
+    private func refreshReplies(entryId: Int, revision: UUID) async {
+        guard let fresh = try? await appState.tdxService.getFeedEntry(id: entryId),
+              selectionRevision == revision,
+              let index = ticketFeed.firstIndex(where: { $0.id == entryId }) else { return }
+        // The single-entry read carries the replies and a current RepliesCount.
+        ticketFeed[index] = fresh
+    }
+
+    /// Re-read the ticket so its Attachments list shows newly uploaded files,
+    /// without resetting fields the user is part-way through editing.
+    private func refreshAttachmentList(ticketId: Int, revision: UUID) {
+        Task {
+            guard let fresh = try? await appState.tdxService.getTicket(id: ticketId),
+                  selectionRevision == revision, selectedTicket?.id == ticketId else { return }
+            detailedTicket = fresh
+        }
+    }
+
+    private static func notificationEmail(_ value: String?) -> String? {
+        guard let email = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !email.isEmpty,
+              email.contains("@") else {
+            return nil
+        }
+        return email
+    }
+
+    /// Seed the comment box with a quote of an existing entry.
+    ///
+    /// The alternative to a threaded reply, from a card's context menu: a new
+    /// top-level comment carrying the context with it, which — unlike a reply —
+    /// can be private and notify people.
+    private func quoteInComment(_ entry: TdxFeedEntry) {
+        let author = entry.createdFullName ?? "Unknown"
+        let quoted = Self.decodeHtml(entry.body ?? "")
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "> \($0)" }
+            .joined(separator: "\n")
+
+        let block = "> \(author) wrote:\n\(quoted)\n\n"
+        newComment = block + newComment
+        isCommentPrivate = isCommentPrivate || entry.isPrivate == true
+        // The comment box folds by default and sits above the feed, so a reply
+        // has to open it and bring it back on screen before focusing.
+        isCommentSectionExpanded = true
+        scrollToCommentToken += 1
+        commentFocused = true
+    }
+
+    // MARK: - Board Drag-and-Drop
+
+    /// Handle a card drop on a board column — updates the field corresponding to the current groupBy
+    private func handleBoardDrop(ticketId: Int, targetColumnKey: String) {
+        Task {
+            do {
+                var changes: [String: Any] = [:]
+                switch boardGroupBy {
+                case .status:
+                    guard let newStatusId = Int(targetColumnKey) else { return }
+                    changes["StatusID"] = newStatusId
+                case .priority:
+                    let targetId = filteredTickets.first(where: { $0.priorityName == targetColumnKey })?.priorityId
+                    guard let newPriorityId = targetId else { return }
+                    changes["PriorityID"] = newPriorityId
+                case .responsible:
+                    if targetColumnKey == "Unassigned" {
+                        changes["ResponsibleUid"] = ""
+                    } else {
+                        let targetUid = filteredTickets.first(where: { $0.responsibleFullName == targetColumnKey })?.responsibleUid
+                        guard let newUid = targetUid else { return }
+                        changes["ResponsibleUid"] = newUid
+                    }
+                case .group:
+                    if targetColumnKey == "No Group" {
+                        changes["ResponsibleGroupID"] = 0
+                    } else {
+                        let targetId = filteredTickets.first(where: { $0.responsibleGroupName == targetColumnKey })?.responsibleGroupId
+                        guard let newGroupId = targetId else { return }
+                        changes["ResponsibleGroupID"] = newGroupId
+                    }
+                }
+                _ = try await appState.tdxService.updateTicket(id: ticketId, updates: changes)
+                loadTickets()
+            } catch {
+                print("Failed to update ticket via board drop: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Apply "me mode" — default group filter from config, default Responsible to self when SSO'd
+    private func applyMeMode() {
+        // Default group filter (always, regardless of SSO)
+        if !filters.isActive(.group),
+           let configGroupId = appState.config.tdxResponsibleGroupId,
+           !tickets.isEmpty {
+            let groupMatch = tickets.first(where: { $0.responsibleGroupId == configGroupId })?.responsibleGroupName
+            if let groupMatch = groupMatch {
+                filters.selectedValues[.group] = [groupMatch]
+            }
+        }
+
+        // Default responsible filter to self (SSO only, once). Deliberately not
+        // keyed off `tdxMe`: that resolves for everyone, and switching this on
+        // would silently narrow the queue from the whole group to one person.
+        guard !meModeApplied,
+              appState.tdxSsoAuthenticated,
+              let userName = appState.tdxAuthenticatedUserName,
+              !tickets.isEmpty else { return }
+
+        let allResponsible = filters.availableValues[.responsible] ?? []
+        let match = allResponsible.first { option in
+            option.localizedCaseInsensitiveContains(userName) ||
+            userName.localizedCaseInsensitiveContains(option)
+        }
+
+        if let match = match {
+            filters.selectedValues[.responsible] = [match]
+            meModeApplied = true
+        }
+    }
+
+    private func compareDates(_ a: String?, _ b: String?) -> Bool {
+        let aVal = a ?? ""
+        let bVal = b ?? ""
+        return sortAscending ? aVal < bVal : aVal > bVal
+    }
+
+    private func compareStrings(_ a: String?, _ b: String?) -> Bool {
+        let aVal = a ?? ""
+        let bVal = b ?? ""
+        return sortAscending
+            ? aVal.localizedCompare(bVal) == .orderedAscending
+            : aVal.localizedCompare(bVal) == .orderedDescending
+    }
+
+    private func formatDateString(_ dateString: String?) -> String {
+        guard let dateString = dateString, let date = Self.parseDate(dateString) else { return "-" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMM d 'at' h:mm a"
+        return formatter.string(from: date)
+    }
+
+    static func parseDate(_ dateString: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: dateString) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: dateString)
+    }
+
+    /// Strip HTML tags and decode entities for plain-text display
+    static func decodeHtml(_ html: String) -> String {
+        var result = html
+        result = result.replacingOccurrences(of: "<br\\s*/?>", with: "\n", options: .regularExpression)
+        result = result.replacingOccurrences(of: "</p>", with: "\n", options: .caseInsensitive)
+        result = result.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "&nbsp;", with: " ")
+        result = result.replacingOccurrences(of: "&amp;", with: "&")
+        result = result.replacingOccurrences(of: "&lt;", with: "<")
+        result = result.replacingOccurrences(of: "&gt;", with: ">")
+        result = result.replacingOccurrences(of: "&quot;", with: "\"")
+        result = result.replacingOccurrences(of: "&#39;", with: "'")
+        result = result.replacingOccurrences(of: "&apos;", with: "'")
+        result = result.replacingOccurrences(of: "\n{3,}", with: "\n\n", options: .regularExpression)
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - Feed Filter Type
+
+enum FeedFilterType: String, CaseIterable {
+    case comments = "Comments"
+    case edits = "Edits"
+    case statusChanges = "Status Changes"
+    case all = "All"
+}
+
+// MARK: - Detail Row
+
+/// Someone a comment can notify: a person, or a group expanded to the
+/// members who take its notifications.
+struct NotifyRecipient: Identifiable, Hashable {
+    let id: String
+    let name: String
+    var roles: [String]
+    let emails: [String]
+}
+
+/// A person held in a ticket's custom attribute, labelled by that attribute.
+struct AttributePerson: Hashable {
+    let label: String
+    let person: TdxPerson
+}
+
+struct DetailRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .top) {
+            Text(label)
+                .appFont(.body)
+                .foregroundColor(.secondary)
+                .frame(width: 100, alignment: .leading)
+            Text(value)
+                .appFont(.body)
+                .textSelection(.enabled)
+            Spacer()
+        }
+    }
+}
+
+// MARK: - Thread Rail
+
+/// What the rail below a comment's avatar has to reach.
+enum ThreadConnectorKind {
+    /// Nothing follows at this level — draw no line.
+    case none
+    /// The next comment sits at the same indent: straight down.
+    case straight
+    /// The next comment is indented further right: down, then a rounded turn.
+    case elbow
+}
+
+private struct ThreadConnectorShape: Shape {
+    let kind: ThreadConnectorKind
+    let elbowRun: CGFloat
+
+    /// Radius of the turn. Large enough to read as a curve at 2pt, small
+    /// enough not to eat the whole horizontal run.
+    private let radius: CGFloat = 10
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        guard kind != .none else { return path }
+
+        let x = rect.midX
+        path.move(to: CGPoint(x: x, y: rect.minY))
+
+        switch kind {
+        case .straight:
+            path.addLine(to: CGPoint(x: x, y: rect.maxY))
+        case .elbow:
+            path.addLine(to: CGPoint(x: x, y: rect.maxY - radius))
+            path.addQuadCurve(
+                to: CGPoint(x: x + radius, y: rect.maxY),
+                control: CGPoint(x: x, y: rect.maxY)
+            )
+            path.addLine(to: CGPoint(x: x + elbowRun, y: rect.maxY))
+        case .none:
+            break
+        }
+        return path
+    }
+}
+
+/// The anchor each rail hangs from. TDX's feed carries no photo for a comment's
+/// author, only a name, so this is initials on a neutral disc.
+private struct ThreadAvatar: View {
+    let name: String?
+    let size: CGFloat
+
+    private var initials: String {
+        let parts = (name ?? "")
+            .split(separator: " ")
+            .filter { $0.first?.isLetter == true }
+        let letters = parts.prefix(2).compactMap { $0.first }
+        return letters.isEmpty ? "?" : String(letters).uppercased()
+    }
+
+    var body: some View {
+        Circle()
+            .fill(Color.secondary.opacity(0.18))
+            .frame(width: size, height: size)
+            .overlay(
+                Text(initials)
+                    .appFont(fixed: 10, weight: .semibold)
+                    .foregroundStyle(.secondary)
+            )
+    }
+}
+
+// MARK: - Feed Entry Row
+
+struct FeedEntryRow: View {
+    let entry: TdxFeedEntry
+    /// Opens the inline reply composer under this thread. Always called with
+    /// the top-level entry: TDX threads are one level deep, so answering a
+    /// reply posts into its parent's thread.
+    var onReply: ((TdxFeedEntry) -> Void)? = nil
+    /// Quotes a comment into the ticket's Add Comment box — a new top-level
+    /// comment, which, unlike a reply, can be private and notify people.
+    var onQuote: ((TdxFeedEntry) -> Void)? = nil
+    /// Deletes one of this thread's replies. Offered only on replies
+    /// `canDeleteReply` accepts.
+    var onDeleteReply: ((TdxFeedEntry) -> Void)? = nil
+    var canDeleteReply: (TdxFeedEntry) -> Bool = { _ in false }
+    /// The open composer, drawn as the thread's last row; nil when closed.
+    var replyComposer: AnyView? = nil
+    var composerAuthor: String? = nil
+
+    // Thread rail geometry. The numbers relate to each other, so they live
+    // together: an elbow has to land on the middle of the next avatar, which
+    // means its horizontal run is the reply indent less half an avatar.
+    private static let avatarSize: CGFloat = 26
+    private static let railSpacing: CGFloat = 10
+    private static let replyIndent: CGFloat = 34
+    private static let rowGap: CGFloat = 10
+    private static var elbowRun: CGFloat { replyIndent - avatarSize / 2 }
+
+    /// A thread connects the way it does in Threads: every comment's avatar
+    /// anchors a neutral rail that runs down the gutter and elbows into the
+    /// avatar of whatever comes next. Replies chain to each other rather than
+    /// all reaching back to the parent, so the line traces reading order.
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            threadRow(
+                entry,
+                isReply: false,
+                connector: entry.replyList.isEmpty && replyComposer == nil ? .none : .elbow
+            )
+
+            ForEach(Array(entry.replyList.enumerated()), id: \.element.id) { index, reply in
+                threadRow(
+                    reply,
+                    isReply: true,
+                    connector: index == entry.replyList.count - 1 && replyComposer == nil ? .none : .straight
+                )
+            }
+
+            if let replyComposer {
+                composerRow(replyComposer)
+            }
+        }
+    }
+
+    /// The composer sits where the next reply will land, on the same rail.
+    private func composerRow(_ composer: AnyView) -> some View {
+        HStack(alignment: .top, spacing: Self.railSpacing) {
+            Color.clear.frame(width: Self.replyIndent - Self.railSpacing, height: 0)
+            ThreadAvatar(name: composerAuthor, size: Self.avatarSize)
+                .frame(width: Self.avatarSize)
+                .accessibilityHidden(true)
+            composer
+                .padding(.bottom, Self.rowGap)
+        }
+    }
+
+    @ViewBuilder
+    private func threadRow(
+        _ item: TdxFeedEntry,
+        isReply: Bool,
+        connector: ThreadConnectorKind
+    ) -> some View {
+        HStack(alignment: .top, spacing: Self.railSpacing) {
+            if isReply {
+                // Less the stack's own spacing, which lands after this spacer —
+                // charge the full indent here and the avatar sits 10pt right of
+                // where the parent's elbow reaches for it.
+                Color.clear.frame(width: Self.replyIndent - Self.railSpacing, height: 0)
+            }
+
+            VStack(spacing: 0) {
+                ThreadAvatar(name: item.createdFullName, size: Self.avatarSize)
+                ThreadConnectorShape(kind: connector, elbowRun: Self.elbowRun)
+                    .stroke(
+                        Color.secondary.opacity(0.35),
+                        style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                    )
+                    .frame(maxHeight: .infinity)
+                    // Draw past the row's bottom edge so an elbow meets the
+                    // side of the next avatar instead of stopping at its top.
+                    .padding(.bottom, connector == .elbow ? -Self.avatarSize / 2 : 0)
+            }
+            .frame(width: Self.avatarSize)
+
+            // The gap between comments sits inside the row so the rail spans
+            // it — put it between rows and the line breaks at every seam.
+            commentCard(item, isReply: isReply)
+                .padding(.bottom, Self.rowGap)
+        }
+    }
+
+    @ViewBuilder
+    private func commentCard(_ item: TdxFeedEntry, isReply: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(item.createdFullName ?? "Unknown")
+                    .appFont(isReply ? .callout : .body)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.primary)
+                Spacer(minLength: 8)
+                if item.isPrivate == true {
+                    Text("Private")
+                        .appFont(.caption2)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.15))
+                        .foregroundColor(.secondary)
+                        .clipShape(Capsule())
+                }
+                if let dateStr = item.createdDate, let date = TicketsView.parseDate(dateStr) {
+                    Text(formatRelativeDate(date))
+                        .appFont(.caption)
+                        .foregroundColor(.secondary)
+                }
+                // Every card can be replied to; a reply to a reply joins the
+                // same thread, since TDX threads are one level deep.
+                if let onReply {
+                    Button(action: { onReply(entry) }) {
+                        Image(systemName: "arrowshape.turn.up.left")
+                            .appFont(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reply in this thread")
+                    .accessibilityLabel("Reply in thread")
+                } else if let onQuote {
+                    Button(action: { onQuote(item) }) {
+                        Image(systemName: "arrowshape.turn.up.left")
+                            .appFont(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Quote this comment in a new comment")
+                    .accessibilityLabel("Quote in new comment")
+                }
+                Button(action: { copyToClipboard(item) }) {
+                    Image(systemName: "doc.on.doc")
+                        .appFont(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Copy to clipboard")
+                .accessibilityLabel("Copy comment")
+            }
+
+            // Only shown when TDX says who was notified. Replies and most
+            // system entries carry no list, and an empty one says nothing.
+            if let notified = item.notifiedList?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !notified.isEmpty {
+                Text("Notified: \(TicketsView.decodeHtml(notified))")
+                    .appFont(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+
+            if let body = item.body, !body.isEmpty {
+                FeedBodyView(html: body, isReply: isReply)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(isReply
+                    ? Color.secondary.opacity(0.08)
+                    : Color(nsColor: .controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+        )
+        .contextMenu { cardMenu(item, isReply: isReply) }
+    }
+
+    @ViewBuilder
+    private func cardMenu(_ item: TdxFeedEntry, isReply: Bool) -> some View {
+        if let onReply {
+            Button("Reply in Thread") { onReply(entry) }
+        }
+        if let onQuote {
+            Button("Quote in New Comment") { onQuote(item) }
+        }
+        Divider()
+        Button("Copy") { copyToClipboard(item) }
+        if isReply, let onDeleteReply, canDeleteReply(item) {
+            Divider()
+            Button("Delete Reply…", role: .destructive) { onDeleteReply(item) }
+        }
+    }
+
+    private func copyToClipboard(_ item: TdxFeedEntry) {
+        let name = item.createdFullName ?? "Unknown"
+        let date = item.createdDate ?? ""
+        let body = TicketsView.decodeHtml(item.body ?? "")
+        let text = "\(name) (\(date)):\n\(body)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    private func formatRelativeDate(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .short
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+// MARK: - Ticket Status Badge
+
+
+struct TicketStatusBadge: View {
+    let statusName: String?
+
+    var body: some View {
+        let color: Color = {
+            switch statusName?.lowercased() {
+            case "new", "open": return .blue
+            case "in progress", "in process": return .orange
+            case "resolved", "closed": return .green
+            case "on hold", "awaiting response": return .gray
+            default: return .secondary
+            }
+        }()
+
+        HStack(spacing: 4) {
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+            Text(statusName ?? "Unknown")
+                .appFont(.body)
+        }
+    }
+}
+
+// MARK: - View Mode Pill Toggle
+
+/// Thin wrapper preserving the existing call site; the control itself now lives
+/// in SegmentedPill so Projects renders an identical one.
+struct ViewModePill: View {
+    @Binding var selection: TicketViewMode
+    @ObservedObject var inbox: TicketInboxModel
+
+    var body: some View {
+        HStack(spacing: 6) {
+            // The inbox leads, as a mailbox does in Mail: a mail icon carrying
+            // the unread count as the system's red badge. While it is open,
+            // neither List nor Board shows as selected.
+            if inbox.isReady {
+                InboxBadgeButton(isSelected: selection == .inbox, unreadCount: inbox.unreadCount) {
+                    withAnimation(.smooth(duration: 0.2)) { selection = .inbox }
+                }
+            }
+            SegmentedPill(
+                selection: $selection,
+                options: [.table, .board],
+                label: { mode in
+                    switch mode {
+                    case .table: "List"
+                    case .board: "Board"
+                    case .inbox: "Inbox"
+                    }
+                },
+                segmentWidth: nil
+            )
+        }
+    }
+}
+
+/// A mail icon with Mail's red count badge: a red capsule, white bold digits,
+/// pinned to the icon's top-trailing corner, hidden at zero.
+struct InboxBadgeButton: View {
+    let isSelected: Bool
+    let unreadCount: Int
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: isSelected ? "envelope.fill" : "envelope")
+                .appFont(fixed: 14, weight: isSelected ? .semibold : .regular)
+                .foregroundStyle(isSelected ? .primary : .secondary)
+                .frame(width: 30, height: 24)
+                .background {
+                    if isSelected { Capsule().fill(.primary.opacity(0.15)) }
+                }
+                .overlay(alignment: .topTrailing) {
+                    if unreadCount > 0 {
+                        UnreadBadge(count: unreadCount)
+                            .offset(x: 6, y: -5)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(unreadCount > 0 ? "Inbox — \(unreadCount) unread" : "Inbox")
+        .accessibilityLabel("Inbox")
+        .accessibilityValue(unreadCount > 0 ? "\(unreadCount) unread" : "No unread")
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+    }
+}
+
+/// The red notification badge macOS draws on Dock icons and Mail mailboxes.
+struct UnreadBadge: View {
+    let count: Int
+
+    var body: some View {
+        Text(InboxBadge.text(count: count) ?? "")
+            .appFont(fixed: 10, weight: .bold)
+            .monospacedDigit()
+            .foregroundStyle(.white)
+            .lineLimit(1)
+            .fixedSize()
+            .padding(.horizontal, 4)
+            .frame(minWidth: 16, minHeight: 16)
+            .background(Capsule().fill(Color(nsColor: .systemRed)))
+            .accessibilityHidden(true)
+    }
+}
+
+// MARK: - Column Resize Handle
+
+struct TicketColumnResizeHandle: View {
+    let field: TicketSortField
+    @Binding var columnWidths: [TicketSortField: CGFloat]
+    @State private var isHovering = false
+    @State private var isDragging = false
+    @State private var startWidth: CGFloat = 0
+
+    var body: some View {
+        Rectangle()
+            .fill(isDragging ? Color.accentColor : Color.secondary.opacity(isHovering ? 0.5 : 0.25))
+            .frame(width: isDragging ? 2 : 1)
+            .frame(maxHeight: .infinity)
+            .padding(.horizontal, 4.5)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 4, coordinateSpace: .global)
+                    .onChanged { value in
+                        if !isDragging {
+                            isDragging = true
+                            startWidth = columnWidths[field] ?? 100
+                        }
+                        columnWidths[field] = max(40, startWidth + value.translation.width)
+                    }
+                    .onEnded { _ in
+                        isDragging = false
+                        startWidth = 0
+                    }
+            )
+            .onHover { inside in
+                isHovering = inside
+                if inside { NSCursor.resizeLeftRight.push() }
+                else { NSCursor.pop() }
+            }
+            .frame(width: 10)
+    }
+}
+
+#if DEBUG
+#Preview {
+    TicketsView()
+        .environmentObject(AppState())
+}
+#endif

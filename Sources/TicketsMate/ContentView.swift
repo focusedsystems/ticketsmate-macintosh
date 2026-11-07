@@ -32,6 +32,9 @@ struct ContentView: View {
                 .environment(\.compactModuleToolbar, windowWidth < Self.compactModuleToolbarBelow)
         }
             .frame(minWidth: 500, minHeight: 400)
+            .environment(\.remoteImageAccess, RemoteImageAccess(
+                tdxBase: URL(string: appState.tdxService.baseUrl),
+                load: { [weak appState] url in try? await appState?.tdxService.fetchBodyImage(url) }))
             // A preference read through a background GeometryReader stopped
             // updating once the window had been narrowed, so widening it
             // again left the toolbar compact. Observe the geometry directly.

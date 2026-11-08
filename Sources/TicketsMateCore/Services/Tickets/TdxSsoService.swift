@@ -1,0 +1,580 @@
+import Foundation
+import WebKit
+import AuthenticationServices
+
+// MARK: - TDX SSO Authentication Result
+
+/// Result of a TDX SSO authentication attempt
+public struct TdxSsoResult: Sendable, Equatable {
+    public let success: Bool
+    public let token: String?
+    public let userName: String?
+    public let userEmail: String?
+    public let error: String?
+    /// The sign-in finished, but its identity could not be confirmed as the
+    /// signed-in user: it is someone else, or one side has no address to
+    /// compare. That is final: retrying the same browser session reaches the
+    /// same account, so callers stop rather than move on to another sign-in
+    /// route, and never fall back to the service account.
+    public var isIdentityRefused: Bool = false
+    
+    public static func success(token: String, userName: String? = nil, userEmail: String? = nil) -> TdxSsoResult {
+        TdxSsoResult(success: true, token: token, userName: userName, userEmail: userEmail, error: nil)
+    }
+    
+    public static func failure(_ error: String) -> TdxSsoResult {
+        TdxSsoResult(success: false, token: nil, userName: nil, userEmail: nil, error: error)
+    }
+
+    /// A sign-in refused because its identity failed the check; the token is
+    /// not carried.
+    public static func identityRefused(_ reason: String) -> TdxSsoResult {
+        var result = failure(reason)
+        result.isIdentityRefused = true
+        return result
+    }
+
+    public static func wrongAccount(signedInAs actual: String, expected: String) -> TdxSsoResult {
+        identityRefused("TDX session belongs to \(actual); expected \(expected)")
+    }
+
+    public static let noAddressInTokenReason =
+        "TDX sign-in refused: the session carries no email or UPN to confirm whose it is"
+
+    public static let unknownExpectedAddressReason =
+        "TDX sign-in refused: the signed-in user's own address could not be determined"
+}
+
+// MARK: - TDX SSO Identity Check
+
+/// Checks that a TDX session belongs to the person signed in on this Mac.
+///
+/// Entra can hold more than one account, and the session TDX hands back is
+/// whichever one the chain ended on. A sign-in is accepted only when its
+/// address is known and equals the signed-in user's own; anything else is
+/// refused outright: the token is never stored, and the sign-in is reported
+/// as failed.
+public enum TdxSsoIdentity {
+    /// Verify a sign-in result's identity against the expected address.
+    ///
+    /// - A token whose address matches (ignoring case and surrounding space)
+    ///   is accepted.
+    /// - A token for a different address is refused with `wrongAccount`.
+    /// - With no expected address there is nothing to compare against, so
+    ///   the sign-in is refused.
+    /// - A token with no address claim cannot be checked, so it is refused.
+    /// - A result that is already a failure passes through unchanged.
+    public static func verify(_ result: TdxSsoResult, expectedUpn: String?) -> TdxSsoResult {
+        guard result.success, result.token != nil else { return result }
+        guard let expected = normalized(expectedUpn) else {
+            return .identityRefused(TdxSsoResult.unknownExpectedAddressReason)
+        }
+        guard let actual = normalized(result.userEmail) else {
+            return .identityRefused(TdxSsoResult.noAddressInTokenReason)
+        }
+        if actual == expected { return result }
+        return .wrongAccount(signedInAs: actual, expected: expected)
+    }
+
+    /// A trimmed, lower-cased address, or nil for anything that is not one.
+    static func normalized(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              value.contains("@") else { return nil }
+        return value
+    }
+}
+
+// MARK: - TDX SSO Delegate Protocol
+
+/// Delegate protocol for TDX SSO authentication events
+@MainActor
+public protocol TdxSsoDelegate: AnyObject {
+    /// Called when SSO authentication completes
+    func tdxSsoDidComplete(result: TdxSsoResult)
+    
+    /// Called when the SSO window should be dismissed
+    func tdxSsoDidRequestDismiss()
+}
+
+// MARK: - TDX SSO Service
+
+/// Service for handling TDX SSO authentication via system browser
+/// Uses ASWebAuthenticationSession to leverage system-level SSO (PSSO)
+@MainActor
+public class TdxSsoService: NSObject {
+    
+    // MARK: - Properties
+    
+    private let config: TicketsMateConfig
+    private var webView: WKWebView?
+    private var authContinuation: CheckedContinuation<TdxSsoResult, Never>?
+    private var authSession: ASWebAuthenticationSession?
+    
+    public weak var delegate: TdxSsoDelegate?
+    
+    /// The TDX SSO login URL
+    /// The Web API's own SSO entry point.
+    ///
+    /// This must be the API endpoint, not the web UI. Pointing the WebView at
+    /// `/TDWorkManagement/` (as this did) logs you into TDNext and leaves a
+    /// *web session cookie* behind — which is not an API credential, which is
+    /// why every scraped "SSO token" was rejected with a 400 and why the app
+    /// fell back to the service account.
+    ///
+    /// `GET /TDWebApi/api/auth/loginsso` 301s into Shibboleth → Entra and, once
+    /// the assertion comes back, returns a real Bearer JWT as the response
+    /// body. That token carries the signed-in person's identity, so their
+    /// actions are attributed to them rather than to the API service account.
+    public var ssoLoginUrl: URL? {
+        guard let baseUrl = config.tdxBaseUrl?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) else {
+            return nil
+        }
+        let rootUrl = baseUrl.replacingOccurrences(of: "/TDWebApi", with: "")
+        return URL(string: "\(rootUrl)/TDWebApi/api/auth/loginsso")
+    }
+    
+    /// Patterns indicating successful authentication
+    private let successPatterns = [
+        "/SBTDClient/",      // TDX client home after login
+        "/TDClient/",        // Another TDX client pattern
+        "/TDNext/",          // TDNext interface
+        "/TDWorkManagement/", // Work management after SSO
+        "/Home/Desktop"      // TDX desktop home
+    ]
+    
+    /// Cookie names to look for JWT token
+    private let tokenCookieNames = [
+        "TDWebApi-AuthToken",
+        "authToken",
+        ".AspNetCore.Cookies"
+    ]
+    
+    // MARK: - Initialization
+    
+    public init(config: TicketsMateConfig) {
+        self.config = config
+        super.init()
+    }
+    
+    // MARK: - Public API
+    
+    /// Check if SSO is available for authentication
+    public var isSsoAvailable: Bool {
+        guard let baseUrl = config.tdxBaseUrl, !baseUrl.isEmpty else {
+            return false
+        }
+        return config.tdxSsoEnabled
+    }
+    
+    /// Create and configure a WebView for SSO authentication
+    /// - Returns: A configured WKWebView ready for SSO login
+    public func createSsoWebView() -> WKWebView {
+        let configuration = WKWebViewConfiguration()
+        
+        // Use default (shared) data store to leverage system cookies and SSO
+        let dataStore = WKWebsiteDataStore.default()
+        configuration.websiteDataStore = dataStore
+        
+        // Allow JavaScript (required for SAML flow)
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        webView.navigationDelegate = self
+        webView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+        
+        self.webView = webView
+        return webView
+    }
+    
+    /// Start the SSO authentication flow
+    /// - Parameter webView: The WebView to use for authentication
+    public func startAuthentication(in webView: WKWebView) {
+        guard let url = ssoLoginUrl else {
+            delegate?.tdxSsoDidComplete(result: .failure("TDX base URL not configured"))
+            return
+        }
+        
+        self.webView = webView
+        webView.navigationDelegate = self
+        
+        let request = URLRequest(url: url)
+        webView.load(request)
+    }
+    
+    /// Authenticate with SSO and wait for result
+    /// - Returns: The SSO authentication result
+    public func authenticate() async -> TdxSsoResult {
+        guard let webView = webView else {
+            return .failure("WebView not configured")
+        }
+        
+        guard let url = ssoLoginUrl else {
+            return .failure("TDX base URL not configured")
+        }
+        
+        return await withCheckedContinuation { continuation in
+            self.authContinuation = continuation
+            let request = URLRequest(url: url)
+            webView.load(request)
+        }
+    }
+    
+    /// Authenticate using system browser with SSO support (PSSO/Platform SSO).
+    /// NOTE: This method is reserved for future OIDC-based auth flows.
+    /// It cannot work with the current SAML/Shibboleth flow because TDX doesn't
+    /// support redirecting to custom URL schemes (ticketsmate://) after SAML assertion.
+    /// ASWebAuthenticationSession requires a callback URL, which the Shibboleth SP won't provide.
+    /// For now, Platform SSO is handled natively in WKWebView via the Enterprise SSO Extension.
+    @available(*, deprecated, message: "Reserved for future OIDC auth. Current SAML flow uses WKWebView + Platform SSO.")
+    public func authenticateWithSystemBrowser() async -> TdxSsoResult {
+        guard let url = ssoLoginUrl else {
+            return .failure("TDX base URL not configured")
+        }
+        
+        // Use a custom URL scheme for callback
+        let callbackScheme = "ticketsmate"
+        
+        return await withCheckedContinuation { continuation in
+            // Create authentication session
+            let session = ASWebAuthenticationSession(url: url, callbackURLScheme: callbackScheme) { callbackURL, error in
+                if let error = error {
+                    // User cancelled or authentication failed
+                    if (error as NSError).code == ASWebAuthenticationSessionError.canceledLogin.rawValue {
+                        continuation.resume(returning: .failure("Authentication cancelled"))
+                    } else {
+                        continuation.resume(returning: .failure(error.localizedDescription))
+                    }
+                    return
+                }
+                
+                // Parse callback URL for token
+                if let callbackURL = callbackURL {
+                    // Extract token from URL parameters or fragment
+                    if let token = self.extractTokenFromURL(callbackURL) {
+                        continuation.resume(returning: .success(token: token))
+                    } else {
+                        continuation.resume(returning: .failure("Could not extract token from callback"))
+                    }
+                } else {
+                    continuation.resume(returning: .failure("No callback URL received"))
+                }
+            }
+            
+            // Use ephemeral session to force fresh authentication or
+            // use default to leverage existing system SSO
+            session.prefersEphemeralWebBrowserSession = false // Use system SSO
+            
+            // Present modally
+            if #available(macOS 10.15, *) {
+                session.presentationContextProvider = self
+            }
+            
+            self.authSession = session
+            session.start()
+        }
+    }
+    
+    /// Extract token from callback URL
+    private func extractTokenFromURL(_ url: URL) -> String? {
+        // Try URL parameters
+        if let components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+            if let token = components.queryItems?.first(where: { $0.name == "token" })?.value {
+                return token
+            }
+        }
+        
+        // Try fragment
+        if let fragment = url.fragment {
+            let pairs = fragment.split(separator: "&")
+            for pair in pairs {
+                let parts = pair.split(separator: "=", maxSplits: 1)
+                if parts.count == 2 && parts[0] == "token" {
+                    return String(parts[1])
+                }
+            }
+        }
+        
+        return nil
+    }
+    
+    /// Extract JWT token from cookies after successful authentication
+    public func extractToken() async -> String? {
+        guard let webView = webView else { return nil }
+        
+        let dataStore = webView.configuration.websiteDataStore
+        let cookies = await dataStore.httpCookieStore.allCookies()
+        
+        // Look for auth token in cookies
+        for cookieName in tokenCookieNames {
+            if let cookie = cookies.first(where: { $0.name == cookieName }) {
+                return cookie.value
+            }
+        }
+        
+        // Try to extract from page JavaScript (localStorage or sessionStorage)
+        if let token = try? await extractTokenFromPage() {
+            return token
+        }
+        
+        return nil
+    }
+    
+    /// Extract user info from the authenticated session
+    public func extractUserInfo() async -> (name: String?, email: String?) {
+        guard let webView = webView else { return (nil, nil) }
+        
+        // Try to get user info from TDX API endpoint
+        let userInfoScript = """
+            (function() {
+                try {
+                    // Check if TDX has user info in global scope
+                    if (typeof CURRENT_USER !== 'undefined') {
+                        return JSON.stringify({
+                            name: CURRENT_USER.FullName || CURRENT_USER.Name,
+                            email: CURRENT_USER.Email || CURRENT_USER.PrimaryEmail
+                        });
+                    }
+                    // Check for TDNext user info
+                    if (typeof window.__TD_USER__ !== 'undefined') {
+                        return JSON.stringify({
+                            name: window.__TD_USER__.fullName,
+                            email: window.__TD_USER__.email
+                        });
+                    }
+                    return null;
+                } catch (e) {
+                    return null;
+                }
+            })();
+        """
+        
+        do {
+            if let result = try await webView.evaluateJavaScript(userInfoScript) as? String,
+               let data = result.data(using: .utf8),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+                return (json["name"], json["email"])
+            }
+        } catch {
+            dbg.warn("[TdxSsoService] Failed to extract user info: \(error)", category: "tdx-sso")
+        }
+        
+        return (nil, nil)
+    }
+    
+    /// Clear all SSO session data
+    public func clearSession() async {
+        let dataStore = WKWebsiteDataStore.default()
+        let dataTypes = Set([
+            WKWebsiteDataTypeCookies,
+            WKWebsiteDataTypeSessionStorage,
+            WKWebsiteDataTypeLocalStorage
+        ])
+        
+        await dataStore.removeData(ofTypes: dataTypes, modifiedSince: .distantPast)
+    }
+    
+    // MARK: - Private Methods
+    
+    private func extractTokenFromPage() async throws -> String? {
+        guard let webView = webView else { return nil }
+        
+        let script = """
+            (function() {
+                // Check localStorage
+                var token = localStorage.getItem('authToken') || 
+                           localStorage.getItem('TDWebApi-AuthToken') ||
+                           localStorage.getItem('jwtToken');
+                if (token) return token;
+                
+                // Check sessionStorage
+                token = sessionStorage.getItem('authToken') ||
+                       sessionStorage.getItem('TDWebApi-AuthToken') ||
+                       sessionStorage.getItem('jwtToken');
+                if (token) return token;
+                
+                // Check for bearer token in any API configuration
+                if (typeof webApiConfig !== 'undefined' && webApiConfig.bearerToken) {
+                    return webApiConfig.bearerToken;
+                }
+                
+                return null;
+            })();
+        """
+        
+        let result = try await webView.evaluateJavaScript(script)
+        return result as? String
+    }
+    
+    private func checkForSuccessfulAuth(url: URL) -> Bool {
+        // Success is landing back on the API's SSO endpoint, which renders the
+        // JWT as its body. The old UI-page patterns are kept only so a stray
+        // redirect into TDNext still terminates the flow instead of hanging.
+        let urlString = url.absoluteString
+        if urlString.contains("/TDWebApi/api/auth/") { return true }
+        return successPatterns.contains { urlString.contains($0) }
+    }
+
+    /// Read the JWT that `loginsso` writes as the page body.
+    ///
+    /// The response is bare text, so WebKit wraps it in a `<pre>`; taking
+    /// `body.innerText` gets the token itself.
+    private func extractTokenFromPageBody() async -> String? {
+        guard let webView else { return nil }
+        let text = try? await webView.evaluateJavaScript("document.body ? document.body.innerText : ''")
+        guard let raw = (text as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+
+        let token = raw.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+        // A JWT is three dot-separated base64 segments starting `eyJ`; anything
+        // else is an error page, and must not be handed out as a credential.
+        guard token.hasPrefix("eyJ"), token.split(separator: ".").count == 3 else { return nil }
+        return token
+    }
+    
+    private func completeAuthentication() {
+        Task {
+            // The API's JWT, if we landed on loginsso, beats anything scraped
+            // from a web session — it is the only form TDX accepts as Bearer.
+            if let apiToken = await extractTokenFromPageBody() {
+                dbg.info("[TdxSsoService] Captured API JWT from loginsso (\(apiToken.count) chars)", category: "tdx-sso")
+                let (userName, userEmail) = await extractUserInfo()
+                let result = TdxSsoResult.success(token: apiToken, userName: userName, userEmail: userEmail)
+                delegate?.tdxSsoDidComplete(result: result)
+                authContinuation?.resume(returning: result)
+                authContinuation = nil
+                return
+            }
+
+            // Extract token
+            guard let token = await extractToken() else {
+                let result = TdxSsoResult.failure("Failed to extract authentication token")
+                delegate?.tdxSsoDidComplete(result: result)
+                authContinuation?.resume(returning: result)
+                authContinuation = nil
+                return
+            }
+            
+            // Extract user info
+            let (userName, userEmail) = await extractUserInfo()
+            
+            let result = TdxSsoResult.success(token: token, userName: userName, userEmail: userEmail)
+            delegate?.tdxSsoDidComplete(result: result)
+            authContinuation?.resume(returning: result)
+            authContinuation = nil
+        }
+    }
+}
+
+// MARK: - WKNavigationDelegate
+
+extension TdxSsoService: WKNavigationDelegate {
+    
+    public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let url = webView.url else { return }
+        
+        dbg.info("[TdxSsoService] Navigation finished: \(url.absoluteString)", category: "tdx-sso")
+        
+        // Check if we've reached a success page
+        if checkForSuccessfulAuth(url: url) {
+            dbg.info("[TdxSsoService] Detected successful authentication", category: "tdx-sso")
+            completeAuthentication()
+        }
+    }
+    
+    public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        dbg.error("[TdxSsoService] Navigation failed: \(error.localizedDescription)", category: "tdx-sso")
+        
+        let result = TdxSsoResult.failure("Navigation failed: \(error.localizedDescription)")
+        delegate?.tdxSsoDidComplete(result: result)
+        authContinuation?.resume(returning: result)
+        authContinuation = nil
+    }
+    
+    public func webView(_ webView: WKWebView, didReceive challenge: URLAuthenticationChallenge, completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        let protectionSpace = challenge.protectionSpace
+        let authMethod = protectionSpace.authenticationMethod
+        
+        dbg.info("[TdxSsoService] Auth challenge: \(authMethod) from \(protectionSpace.host)", category: "tdx-sso")
+        
+        // Handle server trust (SSL)
+        if authMethod == NSURLAuthenticationMethodServerTrust {
+            if let serverTrust = protectionSpace.serverTrust {
+                let credential = URLCredential(trust: serverTrust)
+                completionHandler(.useCredential, credential)
+                return
+            }
+        }
+        
+        // For Negotiate (Kerberos) / NTLM - use default handling which uses system credentials
+        if authMethod == NSURLAuthenticationMethodNegotiate ||
+           authMethod == NSURLAuthenticationMethodNTLM ||
+           authMethod == NSURLAuthenticationMethodDefault {
+            dbg.debug("[TdxSsoService] Using default credential handling for \(authMethod)", category: "tdx-sso")
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        
+        // For other challenges, use default handling
+        completionHandler(.performDefaultHandling, nil)
+    }
+    
+    public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        dbg.error("[TdxSsoService] Provisional navigation failed: \(error.localizedDescription)", category: "tdx-sso")
+        
+        // NSURLErrorCancelled is not an actual error (e.g., redirect)
+        if (error as NSError).code == NSURLErrorCancelled {
+            return
+        }
+        
+        let result = TdxSsoResult.failure("Connection failed: \(error.localizedDescription)")
+        delegate?.tdxSsoDidComplete(result: result)
+        authContinuation?.resume(returning: result)
+        authContinuation = nil
+    }
+    
+    public func webView(_ webView: WKWebView, 
+                        decidePolicyFor navigationAction: WKNavigationAction,
+                        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        
+        if let url = navigationAction.request.url {
+            dbg.debug("[TdxSsoService] Navigating to: \(url.absoluteString)", category: "tdx-sso")
+        }
+        
+        decisionHandler(.allow)
+    }
+    
+    public func webView(_ webView: WKWebView,
+                        decidePolicyFor navigationResponse: WKNavigationResponse,
+                        decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        
+        // Check for auth token in response cookies
+        if let response = navigationResponse.response as? HTTPURLResponse,
+           let url = response.url {
+            
+            // Log response for debugging
+            dbg.debug("[TdxSsoService] Response from \(url.host ?? "unknown"): \(response.statusCode)", category: "tdx-sso")
+            
+            // Check cookies in response
+            if let headerFields = response.allHeaderFields as? [String: String] {
+                let cookies = HTTPCookie.cookies(withResponseHeaderFields: headerFields, for: url)
+                for cookie in cookies {
+                    if tokenCookieNames.contains(cookie.name) {
+                        dbg.info("[TdxSsoService] Found auth token cookie: \(cookie.name)", category: "tdx-sso")
+                    }
+                }
+            }
+        }
+        
+        decisionHandler(.allow)
+    }
+}
+
+// MARK: - ASWebAuthenticationPresentationContextProviding
+
+@available(macOS 10.15, *)
+extension TdxSsoService: ASWebAuthenticationPresentationContextProviding {
+    public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {
+        // Return the main window
+        return NSApplication.shared.windows.first { $0.isKeyWindow } ?? NSApplication.shared.windows.first!
+    }
+}

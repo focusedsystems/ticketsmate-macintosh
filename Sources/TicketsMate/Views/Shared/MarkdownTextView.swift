@@ -15,10 +15,12 @@ struct MarkdownTextView: View {
     /// A whole document (a Handbook page, a SKILL.md) rather than a comment:
     /// real heading sizes and paragraph spacing.
     var document: Bool = false
-    /// Ticket text: written by anyone who can comment, so remote images
-    /// load from TeamDynamix and `imageSite` only, unless the person has
-    /// chosen to load images from other sites.
-    var ticketContent: Bool = false
+    /// Text from a source whose images may load as they are: Projects and
+    /// Development, which have always loaded them. Everything else, ticket
+    /// text above all, is written by anyone who can comment, so by default
+    /// remote images load from TeamDynamix and `imageSite` only, unless the
+    /// person has chosen to load images from other sites.
+    var trustedImages: Bool = false
     /// The one host images may load from beyond TeamDynamix: for a
     /// document, the Handbook site. Without it a document shows no remote
     /// images, and ticket text shows them from TeamDynamix only.
@@ -32,6 +34,17 @@ struct MarkdownTextView: View {
         inline
     }
 
+    /// Whether remote images go through the TDX image policy.
+    var restrictsImages: Bool {
+        true
+    }
+
+    /// Whether this view would load an image from `url`.
+    func mayLoadImage(_ url: URL, tdxBase: URL?, allowExternal: Bool) -> Bool {
+        guard restrictsImages else { return true }
+        return MarkdownContentPolicy.allowsImage(url, tdxBase: tdxBase, site: imageSite, allowExternal: allowExternal)
+    }
+
     /// Links open only in the browser or mail client, whatever the text.
     private var inline: some View {
         policedImages
@@ -43,11 +56,10 @@ struct MarkdownTextView: View {
     /// In ticket text a remote image is a tracking pixel until shown
     /// otherwise: it loads from TeamDynamix or `imageSite`, or from elsewhere
     /// once the person allows it, and always through the TDX image fetch's
-    /// checks. Other text loads its images as MarkdownUI does.
+    /// checks. Text marked `trustedImages` loads its images as MarkdownUI does.
     @ViewBuilder
     private var policedImages: some View {
-        let restrict = true
-        if restrict {
+        if restrictsImages {
             let policy = MarkdownImagePolicy(access: remoteImages, site: imageSite, allowExternal: loadExternalImages)
             rendered
                 .markdownImageProvider(PolicedImageProvider(policy: policy))
@@ -344,6 +356,8 @@ struct EditableMarkdownField: View {
     @Binding var text: String
     var showPreview: Bool = false
     var hideToggle: Bool = false
+    /// Passed to the preview's `MarkdownTextView`.
+    var trustedImages: Bool = false
     @State private var internalShowPreview = false
 
     private var isPreview: Bool { hideToggle ? showPreview : internalShowPreview }
@@ -365,7 +379,7 @@ struct EditableMarkdownField: View {
 
             if isPreview {
                 ScrollView {
-                    MarkdownTextView(content: text.isEmpty ? "*No content*" : text)
+                    MarkdownTextView(content: text.isEmpty ? "*No content*" : text, trustedImages: trustedImages)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)
                 }
